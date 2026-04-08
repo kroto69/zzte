@@ -1,0 +1,48 @@
+version: '3.8'
+
+services:
+  olt-monitor:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: olt-monitor
+    ports:
+      - "8081:8081"
+    environment:
+      - OLT_SERVER_PORT=8081
+      - OLT_SERVER_LOG_LEVEL=info
+      - OLT_REDIS_HOST=redis
+      - OLT_REDIS_PORT=6379
+      - TZ=Asia/Jakarta
+    volumes:
+      - ./config:/app/config:ro
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - olt-network
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: olt-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - olt-network
+    restart: unless-stopped
+
+networks:
+  olt-network:
+    driver: bridge
+
+volumes:
+  redis-data:

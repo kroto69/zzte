@@ -1,0 +1,24 @@
+# Binaries
+olt-monitor
+main
+*.exe
+*.test
+*.out
+
+# Config with secrets
+config/olt_config.yaml
+
+# Logs
+*.log
+nohup.out
+
+# OS specific
+.DS_Store
+Thumbs.db
+
+# IDEs
+.vscode/
+.idea/
+
+# Redis dump
+dump.rdb

@@ -1,0 +1,161 @@
+Template 1: ZTE v2 (Dual Service)
+Service Name: INET1 & HOTSPOT | Config: Standard v2
+
+text
+! --- Add ONU ---
+conf t
+interface gpon-olt_{{slot}}/{{port}}
+onu {{onu_id}} type {{onu_type}} sn {{sn}}
+exit
+
+! --- Config Interface ---
+interface gpon-onu_{{slot}}/{{port}}:{{onu_id}}
+sn-bind enable sn
+name {{name}}
+tcont 1 name INET1 profile {{bandwidth}}
+tcont 2 name HOTSPOT profile {{bandwidth}}
+gemport 1 name INET1 tcont 1
+gemport 1 traffic-limit upstream UP{{bandwidth}} downstream DW{{bandwidth}}
+gemport 2 name HOTSPOT tcont 2
+gemport 2 traffic-limit upstream UP{{bandwidth}} downstream DW{{bandwidth}}
+service-port 1 vport 1 user-vlan {{vlan_hsi}} vlan {{vlan_hsi}}
+service-port 2 vport 2 user-vlan {{vlan_hot}} vlan {{vlan_hot}}
+port-identification format DSL-FORUM-PON sport 1
+pppoe-intermediate-agent enable sport 1
+exit
+
+! --- Config Service & WAN ---
+pon-onu-mng gpon-onu_{{slot}}/{{port}}:{{onu_id}}
+service INET1 gemport 1 vlan {{vlan_hsi}}
+service HOTSPOT gemport 2 vlan {{vlan_hot}}
+wan-ip 1 mode pppoe username {{pppoe_user}} password {{pppoe_pass}} vlan-profile P{{vlan_hsi}} host 1
+wan-ip 1 ping-response enable traceroute-response enable
+security-mgmt 1 mode forward state enable ingress-type wan protocol web
+end
+write
+
+
+
+Template 2: ZTE v1 (Dual Service)
+Service Name: INET1 | Hotspot via VLAN Tagging
+
+text
+! --- Add ONU ---
+conf t
+interface gpon-olt_{{slot}}/{{port}}
+onu {{onu_id}} type {{onu_type}} sn {{sn}}
+exit
+
+! --- Config Interface ---
+interface gpon-onu_{{slot}}/{{port}}:{{onu_id}}
+name {{name}}
+description name {{name}}
+sn-bind enable sn
+tcont 1 name INET1 profile {{bandwidth}}
+gemport 1 name INET1 unicast tcont 1 dir both
+gemport 1 traffic-limit upstream UP{{bandwidth}} downstream DW{{bandwidth}}
+switchport mode hybrid vport 1
+service-port 1 vport 1 user-vlan {{vlan_hsi}} vlan {{vlan_hsi}}
+port-location format dsl-forum sport 1
+port-location sub-option remote-id enable sport 1
+port-location sub-option remote-id name 20 sport 1
+port-location ft-cid {{vlan_hsi}} sport 1
+pppoe-plus enable sport 1
+pppoe-plus trust true replace sport 1
+exit
+
+! --- Config Service & WAN ---
+pon-onu-mng gpon-onu_{{slot}}/{{port}}:{{onu_id}}
+service INET1 type internet gemport 1 vlan {{vlan_hsi}}
+wan-ip 1 mode pppoe username {{pppoe_user}} password {{pppoe_pass}} vlan-profile P{{vlan_hsi}} host 1
+wan-ip 1 ping-response enable traceroute-response enable
+interface wifi wifi_0/1 state unlock
+vlan port eth_0/4 mode tag vlan {{vlan_hot}}
+vlan port wifi_0/2 mode tag vlan {{vlan_hot}}
+security-mng 1 state enable mode permit protocol web
+exit
+end
+write
+
+
+Template 3: Huawei v2 (Dual Service)
+Service Name: INET1 & HOTSPOT | Config: No PPPoE in OLT
+
+text
+! --- Add ONU ---
+conf t
+interface gpon-olt_{{slot}}/{{port}}
+onu {{onu_id}} type {{onu_type}} sn {{sn}}
+exit
+
+! --- Config Interface ---
+interface gpon-onu_{{slot}}/{{port}}:{{onu_id}}
+sn-bind enable sn
+name {{name}}
+tcont 1 name INET1 profile {{bandwidth}}
+tcont 2 name HOTSPOT profile {{bandwidth}}
+gemport 1 name INET1 tcont 1
+gemport 1 traffic-limit upstream UP{{bandwidth}} downstream DW{{bandwidth}}
+gemport 2 name HOTSPOT tcont 2
+gemport 2 traffic-limit upstream UP{{bandwidth}} downstream DW{{bandwidth}}
+service-port 1 vport 1 user-vlan {{vlan_hsi}} vlan {{vlan_hsi}}
+service-port 2 vport 2 user-vlan {{vlan_hot}} vlan {{vlan_hot}}
+port-identification format DSL-FORUM-PON sport 1
+pppoe-intermediate-agent enable sport 1
+exit
+
+! --- Config Service ---
+pon-onu-mng gpon-onu_{{slot}}/{{port}}:{{onu_id}}
+service INET1 gemport 1 vlan {{vlan_hsi}}
+service HOTSPOT gemport 2 vlan {{vlan_hot}}
+end
+write
+
+
+Template 4: Huawei v1 (Dual Service)
+Service Name: INET1 & HOTSPOT | Config: Hybrid Mode
+
+text
+! --- Add ONU ---
+conf t
+interface gpon-olt_{{slot}}/{{port}}
+onu {{onu_id}} type {{onu_type}} sn {{sn}}
+exit
+
+! --- Config Interface ---
+conf t
+interface gpon-onu_{{slot}}/{{port}}:{{onu_id}}
+name {{name}}
+description {{name}}
+sn-bind enable sn
+tcont 1 name INET1 profile {{bandwidth}}
+tcont 2 name HOTSPOT profile {{bandwidth}}
+gemport 1 name INET1 unicast tcont 1 dir both
+gemport 2 name HOTSPOT unicast tcont 2 dir both
+gemport 1 traffic-limit upstream UP{{bandwidth}} downstream DW{{bandwidth}}
+gemport 2 traffic-limit upstream UP{{bandwidth}} downstream DW{{bandwidth}}
+switchport mode hybrid vport 1
+switchport mode hybrid vport 2
+service-port 1 vport 1 user-vlan {{vlan_hsi}} vlan {{vlan_hsi}}
+service-port 2 vport 2 user-vlan {{vlan_hot}} vlan {{vlan_hot}}
+exit
+
+! --- Config Service ---
+pon-onu-mng gpon-onu_{{slot}}/{{port}}:{{onu_id}}
+service INET1 gemport 1 vlan {{vlan_hsi}}
+service HOTSPOT gemport 2 vlan {{vlan_hot}}
+end
+write
+
+
+
+
+🎯 Summary Variabel:
+Variabel	Keterangan	Contoh
+{{vlan_hsi}}	VLAN Internet (INET1)	202
+{{vlan_hot}}	VLAN Hotspot (HOTSPOT)	50
+{{bandwidth}}	Bandwidth Profile	100M
+{{name}}	Nama Customer	LASMIN
+{{pppoe_user}}	Username PPPoE (ZTE)	user@isp
+{{pppoe_pass}}	Password PPPoE (ZTE)	123456
+

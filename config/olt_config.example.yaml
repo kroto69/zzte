@@ -1,0 +1,32 @@
+app:
+  port: 8081
+  log_level: info
+
+redis:
+  host: localhost
+  port: 6379
+  password: ""
+  db: 0
+
+# Search Configuration
+search:
+  enabled: true
+  interval: 10 # minutes
+
+users:
+  admin:
+    password: admin
+    role: superadmin
+  teknisi:
+    password: teknisi
+    role: technician
+
+olts:
+  # Example OLT
+  olt_sample_01:
+    name: "OLT Sample"
+    host: "192.168.1.100"
+    port: 161
+    community: "public"
+    timeout: 5
+    retries: 2
