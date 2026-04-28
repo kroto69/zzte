@@ -2,15 +2,17 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 
+	"github.com/redis/go-redis/v9"
 	"github.com/rs/zerolog/log"
 
+	"olt-monitor/internal/cache"
 	"olt-monitor/internal/snmp"
 )
 
-// OLTSystemInfo contains system-level metrics for an OLT
 type OLTSystemInfo struct {
 	OltID       string `json:"oltId"`
 	Name        string `json:"name"`
@@ -24,19 +26,24 @@ type OLTSystemInfo struct {
 	IsOnline    bool   `json:"isOnline"`
 }
 
-// SystemService handles OLT system-level operations
 type SystemService struct {
 	oltManager *OLTManager
+	cache      *cache.RedisCache
 }
 
-// NewSystemService creates a new system service
 func NewSystemService(manager *OLTManager) *SystemService {
 	return &SystemService{
 		oltManager: manager,
 	}
 }
 
-// OIDs for System Info
+func NewSystemServiceWithCache(manager *OLTManager, c *cache.RedisCache) *SystemService {
+	return &SystemService{
+		oltManager: manager,
+		cache:      c,
+	}
+}
+
 const (
 	OIDSysDescr    = ".1.3.6.1.2.1.1.1.0"
 	OIDSysName     = ".1.3.6.1.2.1.1.5.0"
@@ -45,8 +52,20 @@ const (
 	OIDMemoryUsage = ".1.3.6.1.4.1.3902.1015.2.1.1.3.1.11.1.1.1"
 )
 
-// GetSystemInfo retrieves system information for a specific OLT
 func (s *SystemService) GetSystemInfo(ctx context.Context, oltID string) (*OLTSystemInfo, error) {
+	if s.cache != nil {
+		cacheData, err := s.cache.GetHealth(ctx, oltID)
+		if err == nil {
+			var info OLTSystemInfo
+			if json.Unmarshal(cacheData, &info) == nil {
+				log.Debug().Str("oltId", oltID).Msg("System info from cache")
+				return &info, nil
+			}
+		} else if err != redis.Nil {
+			log.Warn().Err(err).Msg("Cache read error")
+		}
+	}
+
 	olt, err := s.oltManager.GetOLT(oltID)
 	if err != nil {
 		return nil, fmt.Errorf("OLT not found: %s", oltID)
@@ -55,7 +74,6 @@ func (s *SystemService) GetSystemInfo(ctx context.Context, oltID string) (*OLTSy
 	client, err := s.oltManager.GetClient(oltID)
 	if err != nil {
 		log.Warn().Err(err).Str("oltId", oltID).Msg("Failed to get SNMP client")
-		// Return offline status
 		return &OLTSystemInfo{
 			OltID:    oltID,
 			Name:     olt.Name,
@@ -77,7 +95,6 @@ func (s *SystemService) GetSystemInfo(ctx context.Context, oltID string) (*OLTSy
 		IsOnline: true,
 	}
 
-	// Get all system OIDs
 	oids := []string{OIDSysDescr, OIDSysName, OIDSysUptime, OIDCPUUsage, OIDMemoryUsage}
 	result, err := client.GetMultiple(oids)
 	if err != nil {
@@ -86,7 +103,6 @@ func (s *SystemService) GetSystemInfo(ctx context.Context, oltID string) (*OLTSy
 		return info, nil
 	}
 
-	// Parse results
 	for _, pdu := range result {
 		switch {
 		case strings.HasSuffix(pdu.Name, ".1.3.6.1.2.1.1.1.0"):
@@ -103,10 +119,17 @@ func (s *SystemService) GetSystemInfo(ctx context.Context, oltID string) (*OLTSy
 		}
 	}
 
+	if s.cache != nil {
+		if data, err := json.Marshal(info); err == nil {
+			if err := s.cache.SetHealth(ctx, oltID, data); err != nil {
+				log.Warn().Err(err).Msg("Failed to cache system info")
+			}
+		}
+	}
+
 	return info, nil
 }
 
-// GetAllSystemInfo retrieves system info for all registered OLTs
 func (s *SystemService) GetAllSystemInfo(ctx context.Context) ([]*OLTSystemInfo, error) {
 	olts := s.oltManager.ListOLTs()
 	result := make([]*OLTSystemInfo, 0, len(olts))
@@ -121,7 +144,6 @@ func (s *SystemService) GetAllSystemInfo(ctx context.Context) ([]*OLTSystemInfo,
 	return result, nil
 }
 
-// ParseUptime converts timeticks (1/100th second) to human readable string
 func ParseUptime(ticks int64) string {
 	seconds := ticks / 100
 	minutes := seconds / 60
