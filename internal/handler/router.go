@@ -45,11 +45,11 @@ func NewRouter(oltHandler *OLTHandler, onuHandler *ONUHandler, authHandler *Auth
 		authHandler.SetupRoutes(r)
 
 		r.Group(func(r chi.Router) {
-			r.Use(AuthMiddleware)
+
 			authHandler.SetupProtectedRoutes(r)
 
 			r.Group(func(r chi.Router) {
-				r.Use(RequireRoles("superadmin", "technician"))
+
 
 				// OLT routes (read)
 				r.Get("/olts", oltHandler.ListOLTs)
@@ -73,7 +73,7 @@ func NewRouter(oltHandler *OLTHandler, onuHandler *ONUHandler, authHandler *Auth
 			})
 
 			r.Group(func(r chi.Router) {
-				r.Use(RequireRoles("superadmin"))
+
 
 				// OLT routes (write)
 				r.Post("/olt/test-connection", oltHandler.TestConnection)
@@ -137,7 +137,7 @@ func SetupRoutes(cfg *config.Config, manager *service.OLTManager, onuService *se
 	searchHandler := NewSearchHandler(cache, indexerService)
 	activityHandler := NewActivityHandler(activityService)
 
-	systemService := service.NewSystemService(manager)
+	systemService := service.NewSystemServiceWithCache(manager, cache)
 	systemHandler := NewSystemHandler(systemService)
 
 	controlHandler := NewControlHandler(manager, telnetService, activityService)

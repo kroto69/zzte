@@ -494,8 +494,16 @@ DELETE /api/v1/olt/{oltId}
 GET /api/v1/olt/{oltId}/board/{board}/pon/{pon}
 ```
 
-Optional query:
-- `fresh=1` to bypass cache and fetch real-time data.
+Returns lightweight list of ONUs on a PON port (only essential fields).
+
+**Query Parameters:**
+
+| Param | Type | Description |
+|-------|------|-------------|
+| `fresh` | bool | Skip cache, force on-demand SNMP walk (`true`/`1`) |
+| `refresh` | bool | Same as `fresh` — skip cache and walk SNMP directly |
+
+**URL Parameters:**
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
@@ -509,31 +517,38 @@ Optional query:
   "success": true,
   "data": [
     {
-      "oltId": "olt_kita_01",
-      "board": 2,
-      "pon": 7,
+      "oltId": "olt_1",
+      "board": 1,
+      "pon": 2,
       "onuId": 1,
       "name": "ONU-0001",
       "serialNumber": "ZTEG12345678",
-      "type": "F660",
       "status": "Online",
       "statusCode": 3,
-      "rxPower": -18.5,
-      "txPower": 2.3,
-      "distanceM": 1250,
-      "distanceKm": 1.25,
-      "lastOnline": "2024-01-27T10:30:00Z",
-      "lastOffline": "2024-01-26T22:15:00Z",
-      "offlineReason": "Normal",
-      "offlineCode": 0,
-      "wanIp": "10.10.10.10"
+      "rxPower": -18.5
     }
   ]
 }
 ```
 
-**Cache Key:** `olt:{oltId}:board:{board}:pon:{pon}:list`
-**Cache TTL:** 60 seconds
+**ONUListItem Fields:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| oltId | string | OLT identifier |
+| board | int | Board/Shelf number |
+| pon | int | PON port number |
+| onuId | int | ONU index on PON |
+| name | string | ONU name (may be empty if not yet cached by Names Poller) |
+| serialNumber | string | ONU serial number (may be empty if not yet cached) |
+| status | string | Human-readable status |
+| statusCode | int | Numeric status code (see Status Codes table) |
+| rxPower | float | RX power in dBm |
+
+**Cache Behavior (3-level fallback):**
+1. Complete list cache (Name populated) → returns in < 100ms
+2. Incomplete list + Names cache → merge, fast return
+3. No cache → on-demand SNMP walk (~7-12s), save to both caches
 
 ---
 
@@ -543,8 +558,14 @@ Optional query:
 GET /api/v1/olt/{oltId}/board/{board}/pon/{pon}/onu/{onuId}
 ```
 
-Optional query:
-- `fresh=1` to bypass cache and fetch real-time data.
+Returns complete ONU information with all fields. Uses batch `GetMultiple` for fast retrieval.
+
+**Query Parameters:**
+
+| Param | Type | Description |
+|-------|------|-------------|
+| `fresh` | bool | Skip cache, force on-demand SNMP GET |
+| `refresh` | bool | Same as `fresh` |
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
@@ -581,7 +602,7 @@ Optional query:
 ```
 
 **Cache Key:** `olt:{oltId}:onu:{board}:{pon}:{onuId}`
-**Cache TTL:** 2 minutes
+**Cache TTL:** ~2-4 minutes (adaptive: `baseTTL + duration×2`, max `baseTTL×5`)
 
 ---
 
@@ -896,6 +917,45 @@ POST /api/v1/provisioning/preview
 
 ---
 
+## Cache & Poller Architecture
+
+### Redis Cache Keys
+
+| Cache | Key Pattern | TTL | Refreshed By |
+|-------|-------------|-----|---------------|
+| ONU List | `olt:{oltId}:board:{board}:pon:{pon}:list` | ~74-120s (adaptive) | API request, Optical Poller |
+| Names | `olt:{oltId}:board:{board}:pon:{pon}:names` | 10h | API request, Names Poller |
+| Detail | `olt:{oltId}:onu:{board}:{pon}:{onuId}` | ~2-4min (adaptive) | API request |
+| OLT Info | `olt:{oltId}:info` | 5min | API request |
+| Health | `olt:{oltId}:health` | 30s | API request |
+| Search Index | `olt:global:index` | — | Indexer (if enabled) |
+
+### Adaptive TTL
+
+List and Detail caches use `baseTTL + (walk_duration × 2)` with a max of `baseTTL × 5`. Slower SNMP walks get longer TTL to reduce unnecessary re-walks.
+
+### Background Pollers
+
+| Poller | Data | Interval | Connection |
+|--------|------|----------|-------------|
+| Optical Poller | Status + RX Power per PON | 60s | Separate (`GetNewClient`) |
+| Names Poller | Name + Serial Number per PON | 8h | Separate (`GetNewClient`) |
+
+Both pollers:
+- Walk per-PON with scoped BulkWalk (not global) to avoid timeouts on large OLTs
+- Use separate SNMP connections (`GetNewClient`) to not block API requests
+- Optical Poller merges Name/SN from Names cache before writing to list cache
+- Names Poller saves to Names cache only
+
+### Cache Invalidation
+
+- Update OLT config → clear `olt:{oltId}:*`
+- Delete OLT → clear `olt:{oltId}:*`
+- `?fresh=true` / `?refresh=true` → skip cache, force on-demand walk
+- ONU Reboot → invalidate specific ONU detail cache
+
+---
+
 ## Data Reference
 
 ### ONU Status Codes
@@ -946,11 +1006,13 @@ ifIndex = (1 * 33554432) + (2 * 65536) + (7 * 256)
 
 | Status | Description |
 |--------|-------------|
-| 400 | Bad Request - Invalid parameters |
-| 401 | Unauthorized - Missing/invalid token (JSON error response) |
-| 404 | Not Found - Resource tidak ditemukan |
-| 409 | Conflict - Resource sudah ada |
-| 500 | Internal Server Error |
+| 400 | Bad Request — invalid parameters or missing required fields |
+| 401 | Unauthorized — missing or invalid JWT token |
+| 403 | Forbidden — insufficient role permissions |
+| 404 | Not Found — resource tidak ditemukan |
+| 409 | Conflict — resource sudah ada |
+| 429 | Too Many Requests — rate limited atau akun terkunci (5 menit setelah 5x gagal login) |
+| 500 | Internal Server Error — SNMP/Telnet/Redis failure |
 
 **Error Format (umum):**
 ```json

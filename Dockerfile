@@ -1,5 +1,5 @@
 # Build stage
-FROM golang:1.24.10-alpine AS builder
+FROM golang:1.25-alpine AS builder
 
 ARG ALPINE_MIRROR=https://mirror.sgp1.digitalocean.com/alpine
 RUN set -eux; \

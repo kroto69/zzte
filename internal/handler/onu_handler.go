@@ -1,10 +1,12 @@
 package handler
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/rs/zerolog/log"
@@ -54,10 +56,18 @@ func (h *ONUHandler) GetONUList(w http.ResponseWriter, r *http.Request) {
 		Msg("Getting ONU list")
 
 	fresh := r.URL.Query().Get("fresh")
-	force := fresh == "1" || strings.ToLower(fresh) == "true"
+	refresh := r.URL.Query().Get("refresh")
+	force := fresh == "1" || strings.ToLower(fresh) == "true" || refresh == "1" || strings.ToLower(refresh) == "true"
 
-	onus, err := h.onuService.GetONUList(r.Context(), oltID, board, pon, force)
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+
+	onus, err := h.onuService.GetONUList(ctx, oltID, board, pon, force)
 	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
+			Error(w, http.StatusGatewayTimeout, "SNMP request timeout (30s)")
+			return
+		}
 		if errors.Is(err, domain.ErrOLTNotFound) {
 			NotFound(w, "OLT not found")
 			return
@@ -109,7 +119,8 @@ func (h *ONUHandler) GetONUDetail(w http.ResponseWriter, r *http.Request) {
 		Msg("Getting ONU detail")
 
 	fresh := r.URL.Query().Get("fresh")
-	force := fresh == "1" || strings.ToLower(fresh) == "true"
+	refresh := r.URL.Query().Get("refresh")
+	force := fresh == "1" || strings.ToLower(fresh) == "true" || refresh == "1" || strings.ToLower(refresh) == "true"
 
 	onu, err := h.onuService.GetONUDetail(r.Context(), oltID, board, pon, onuID, force)
 	if err != nil {

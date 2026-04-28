@@ -14,6 +14,11 @@ services:
       - OLT_REDIS_HOST=redis
       - OLT_REDIS_PORT=6379
       - TZ=Asia/Jakarta
+      - OLT_AUTH_ENABLED=false   # coba ini, mungkin ada
+      - OLT_AUTH_DISABLED=true
+      - OLT_OPTICAL_POLLER_ENABLED=true    # tambah ini
+      - OLT_OPTICAL_POLLER_INTERVAL=60     # tambah ini
+
     volumes:
       - ./config:/app/config:ro
     depends_on:

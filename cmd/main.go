@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -11,6 +13,7 @@ import (
 	"olt-monitor/internal/cache"
 	"olt-monitor/internal/config"
 	"olt-monitor/internal/handler"
+	"olt-monitor/internal/poller"
 	"olt-monitor/internal/server"
 	"olt-monitor/internal/service"
 )
@@ -48,7 +51,6 @@ func main() {
 	// Register OLTs from config
 	for id, oltCfg := range cfg.OLTs {
 		instance := oltCfg.ToOLTInstance(id)
-		// Fix: Use context.Background() instead of nil
 		if _, err := manager.RegisterOLT(context.Background(), instance); err != nil {
 			log.Error().Err(err).Str("oltId", id).Msg("Failed to register OLT from config")
 		} else {
@@ -60,12 +62,54 @@ func main() {
 	onuService := service.NewONUService(manager, redisCache)
 	indexerService := service.NewIndexerService(manager, redisCache, cfg)
 
-	// Start Background Sync (every 10 minutes)
-	indexerService.StartBackgroundSync(10 * time.Minute)
+	// Context untuk graceful shutdown
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Start optical poller jika enabled
+	var opticalPoller *poller.OpticalPoller
+	if cfg.OpticalPoller.Enabled {
+		opticalPoller = poller.NewOpticalPoller(manager, redisCache, cfg)
+		opticalPoller.Start(ctx)
+		log.Info().Int("interval", cfg.OpticalPoller.Interval).Msg("Optical poller started")
+	}
+
+	// Start names poller jika enabled
+	var namesPoller *poller.NamesPoller
+	if cfg.NamesPoller.Enabled {
+		namesPoller = poller.NewNamesPoller(manager, redisCache, cfg)
+		namesPoller.Start(ctx)
+		log.Info().Int("interval", cfg.NamesPoller.Interval).Msg("Names poller started")
+	}
+
+	// Start background search indexer jika enabled
+	if cfg.Search.Enabled && cfg.Search.Interval > 0 {
+		indexerService.StartBackgroundSync(time.Duration(cfg.Search.Interval) * time.Minute)
+	}
 
 	// Setup HTTP server
 	router := handler.SetupRoutes(cfg, manager, onuService, indexerService, redisCache)
 	srv := server.NewServer(cfg, router)
+
+	// Graceful shutdown
+	go func() {
+		sigCh := make(chan os.Signal, 1)
+		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+		sig := <-sigCh
+		log.Info().Str("signal", sig.String()).Msg("Menerima signal shutdown")
+
+		cancel() // Batalkan context poller
+
+		if opticalPoller != nil {
+			opticalPoller.Stop()
+		}
+		if namesPoller != nil {
+			namesPoller.Stop()
+		}
+
+		log.Info().Msg("Shutdown selesai")
+		os.Exit(0)
+	}()
 
 	// Start server
 	log.Info().Int("port", cfg.Server.Port).Msg("Starting server")

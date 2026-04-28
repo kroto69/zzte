@@ -1,8 +1,6 @@
 module olt-monitor
 
-go 1.22.5
-
-toolchain go1.24.10
+go 1.25.0
 
 require (
 	github.com/go-chi/chi/v5 v5.0.12
@@ -14,6 +12,7 @@ require (
 	github.com/spf13/viper v1.18.2
 	github.com/ziutek/telnet v0.1.0
 	golang.org/x/crypto v0.16.0
+	golang.org/x/sync v0.20.0
 )
 
 require (
