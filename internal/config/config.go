@@ -11,12 +11,26 @@ import (
 
 // Config holds all application configuration
 type Config struct {
-	Server ServerConfig           `mapstructure:"server"`
-	Redis  RedisConfig            `mapstructure:"redis"`
-	Search SearchConfig           `mapstructure:"search"`
-	OLTs   map[string]OLTConfig   `mapstructure:"olts"`
-	Users  map[string]UserAccount `mapstructure:"users"`
-	v      *viper.Viper
+	Server        ServerConfig           `mapstructure:"server"`
+	Redis         RedisConfig            `mapstructure:"redis"`
+	Search        SearchConfig           `mapstructure:"search"`
+	OpticalPoller OpticalPollerConfig    `mapstructure:"optical_poller"`
+	NamesPoller   NamesPollerConfig      `mapstructure:"names_poller"`
+	OLTs          map[string]OLTConfig   `mapstructure:"olts"`
+	Users         map[string]UserAccount `mapstructure:"users"`
+	v             *viper.Viper
+}
+
+// OpticalPollerConfig konfigurasi untuk background optical poller
+type OpticalPollerConfig struct {
+	Enabled  bool `mapstructure:"enabled"`
+	Interval int  `mapstructure:"interval"` // dalam detik
+}
+
+// NamesPollerConfig konfigurasi untuk background names poller (Name + SerialNumber)
+type NamesPollerConfig struct {
+	Enabled  bool `mapstructure:"enabled"`
+	Interval int  `mapstructure:"interval"` // dalam detik
 }
 
 // ServerConfig holds application settings
@@ -49,6 +63,7 @@ type OLTConfig struct {
 	Community    string            `mapstructure:"community"`
 	Timeout      int               `mapstructure:"timeout"`
 	Retries      int               `mapstructure:"retries"`
+	PollInterval int               `mapstructure:"poll_interval"` // detik, 0 = pakai global
 	Telnet       TelnetConfig      `mapstructure:"telnet"`
 	VlanProfiles map[string]string `mapstructure:"vlan_profiles"`
 }
@@ -77,8 +92,12 @@ func Load(path string) (*Config, error) {
 	v.SetDefault("redis.host", "localhost")
 	v.SetDefault("redis.port", 6379)
 	v.SetDefault("redis.db", 0)
-	v.SetDefault("search.enabled", true)
-	v.SetDefault("search.interval", 10)
+	v.SetDefault("search.enabled", false)
+	v.SetDefault("search.interval", 0)
+	v.SetDefault("optical_poller.enabled", true)
+	v.SetDefault("optical_poller.interval", 60)
+	v.SetDefault("names_poller.enabled", true)
+	v.SetDefault("names_poller.interval", 28800)
 
 	// Config file
 	v.SetConfigName("olt_config")
@@ -175,6 +194,7 @@ func (c *OLTConfig) ToOLTInstance(id string) domain.OLTInstance {
 			SNMP:         snmp,
 			Telnet:       telnet,
 			VlanProfiles: c.VlanProfiles,
+			PollInterval: c.PollInterval,
 		},
 		SNMP:   snmp,
 		Telnet: telnet,

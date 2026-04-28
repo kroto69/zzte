@@ -38,13 +38,14 @@ type PONInfo struct {
 
 // OLTConfig represents OLT configuration
 type OLTConfig struct {
-	ID        string       `mapstructure:"id" json:"id"`
-	Name      string       `mapstructure:"name" json:"name"`
-	SNMP      SNMPConfig   `mapstructure:"snmp" json:"snmp"`
-	Telnet    TelnetConfig `mapstructure:"telnet" json:"telnet"`
+	ID           string            `mapstructure:"id" json:"id"`
+	Name         string            `mapstructure:"name" json:"name"`
+	SNMP         SNMPConfig        `mapstructure:"snmp" json:"snmp"`
+	Telnet       TelnetConfig      `mapstructure:"telnet" json:"telnet"`
 	VlanProfiles map[string]string `mapstructure:"vlan_profiles" json:"vlanProfiles,omitempty"`
-	IsOnline  bool         `json:"isOnline"`
-	LastCheck time.Time    `json:"lastCheck"`
+	PollInterval int              `mapstructure:"poll_interval" json:"pollInterval,omitempty"`
+	IsOnline     bool              `json:"isOnline"`
+	LastCheck    time.Time         `json:"lastCheck"`
 }
 
 // OLTInstance represents a connected OLT

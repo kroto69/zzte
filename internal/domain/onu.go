@@ -2,7 +2,7 @@ package domain
 
 import "time"
 
-// ONU represents an Optical Network Unit connected to an OLT
+// ONU represents an Optical Network Unit connected to an OLT (full detail)
 type ONU struct {
 	OltID         string    `json:"oltId"`
 	Board         int       `json:"board"`
@@ -13,15 +13,50 @@ type ONU struct {
 	Type          string    `json:"type"`
 	Status        string    `json:"status"`
 	StatusCode    int       `json:"statusCode"`
-	RXPower       float64   `json:"rxPower"`    // dBm
-	TXPower       float64   `json:"txPower"`    // dBm
-	DistanceM     int       `json:"distanceM,omitempty"`  // meters
-	DistanceKm    float64   `json:"distanceKm,omitempty"` // kilometers
+	RXPower       float64   `json:"rxPower"`
+	TXPower       float64   `json:"txPower"`
+	DistanceM     int       `json:"distanceM,omitempty"`
+	DistanceKm    float64   `json:"distanceKm,omitempty"`
 	LastOnline    time.Time `json:"lastOnline"`
 	LastOffline   time.Time `json:"lastOffline"`
 	OfflineReason string    `json:"offlineReason"`
 	OfflineCode   int       `json:"offlineCode"`
 	WanIp         string    `json:"wanIp"`
+}
+
+// ONUListItem is the lightweight response for list endpoints (only populated fields)
+type ONUListItem struct {
+	OltID        string  `json:"oltId"`
+	Board        int     `json:"board"`
+	Pon          int     `json:"pon"`
+	OnuID        int     `json:"onuId"`
+	Name         string  `json:"name"`
+	SerialNumber string  `json:"serialNumber"`
+	Status       string  `json:"status"`
+	StatusCode   int     `json:"statusCode"`
+	RXPower      float64 `json:"rxPower"`
+}
+
+// ONUNameEntry caches static ONU identity (Name + SerialNumber) with long TTL
+type ONUNameEntry struct {
+	OnuID        int    `json:"onuId"`
+	Name         string `json:"name"`
+	SerialNumber string `json:"serialNumber"`
+}
+
+// ToListItem converts a full ONU to a lightweight list item
+func (o *ONU) ToListItem() ONUListItem {
+	return ONUListItem{
+		OltID:        o.OltID,
+		Board:        o.Board,
+		Pon:          o.Pon,
+		OnuID:        o.OnuID,
+		Name:         o.Name,
+		SerialNumber: o.SerialNumber,
+		Status:       o.Status,
+		StatusCode:   o.StatusCode,
+		RXPower:      o.RXPower,
+	}
 }
 
 // ONUStatus constants
