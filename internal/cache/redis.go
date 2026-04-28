@@ -12,10 +12,12 @@ import (
 
 // TTL constants for different cache types
 const (
-	TTLOLTInfo   = 5 * time.Minute
-	TTLONUList   = 60 * time.Second
-	TTLONUDetail = 2 * time.Minute
-	TTLHealth    = 30 * time.Second
+	TTLOLTInfo    = 5 * time.Minute
+	TTLONUList    = 60 * time.Second
+	TTLONUDetail  = 2 * time.Minute
+	TTLONUNames   = 10 * time.Hour
+	TTLHealth     = 5 * time.Minute
+	TTLPONList    = 5 * time.Minute
 	MaxActivityEntries = 500
 )
 
@@ -24,8 +26,10 @@ const (
 	KeyOLTInfo     = "olt:%s:info"
 	KeyOLTFirmware = "olt:%s:firmware"
 	KeyONUList     = "olt:%s:board:%d:pon:%d:list"
+	KeyONUNames    = "olt:%s:board:%d:pon:%d:names"
 	KeyONUDetail   = "olt:%s:onu:%d:%d:%d"
 	KeyOLTHealth   = "olt:%s:health"
+	KeyPONList     = "olt:%s:board:%d:pon:list"
 	KeyOLTPattern  = "olt:%s:*"
 	KeyActivityLog = "activity:log"
 )
@@ -96,6 +100,18 @@ func (c *RedisCache) SetONUListWithTTL(ctx context.Context, oltID string, board,
 	return c.client.Set(ctx, key, data, ttl).Err()
 }
 
+// --- ONU Names ---
+
+func (c *RedisCache) GetONUNames(ctx context.Context, oltID string, board, pon int) ([]byte, error) {
+	key := fmt.Sprintf(KeyONUNames, oltID, board, pon)
+	return c.client.Get(ctx, key).Bytes()
+}
+
+func (c *RedisCache) SetONUNames(ctx context.Context, oltID string, board, pon int, data []byte) error {
+	key := fmt.Sprintf(KeyONUNames, oltID, board, pon)
+	return c.client.Set(ctx, key, data, TTLONUNames).Err()
+}
+
 // --- ONU Detail ---
 
 // GetONUDetail retrieves single ONU detail from cache
@@ -115,6 +131,26 @@ func (c *RedisCache) SetONUDetailWithTTL(ctx context.Context, oltID string, boar
 	key := fmt.Sprintf(KeyONUDetail, oltID, board, pon, onuID)
 	if ttl <= 0 {
 		ttl = TTLONUDetail
+	}
+	return c.client.Set(ctx, key, data, ttl).Err()
+}
+
+// --- PON List ---
+
+func (c *RedisCache) GetPONList(ctx context.Context, oltID string, board int) ([]byte, error) {
+	key := fmt.Sprintf(KeyPONList, oltID, board)
+	return c.client.Get(ctx, key).Bytes()
+}
+
+func (c *RedisCache) SetPONList(ctx context.Context, oltID string, board int, data []byte) error {
+	key := fmt.Sprintf(KeyPONList, oltID, board)
+	return c.client.Set(ctx, key, data, TTLPONList).Err()
+}
+
+func (c *RedisCache) SetPONListWithTTL(ctx context.Context, oltID string, board int, data []byte, ttl time.Duration) error {
+	key := fmt.Sprintf(KeyPONList, oltID, board)
+	if ttl <= 0 {
+		ttl = TTLPONList
 	}
 	return c.client.Set(ctx, key, data, ttl).Err()
 }
