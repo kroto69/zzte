@@ -26,10 +26,10 @@ func NewClient(config domain.SNMPConfig) (*Client, error) {
 		config.Port = 161
 	}
 	if config.Timeout == 0 {
-		config.Timeout = 5
+		config.Timeout = 15
 	}
 	if config.Retries == 0 {
-		config.Retries = 2
+		config.Retries = 1
 	}
 	if config.Community == "" {
 		config.Community = "public"
@@ -38,12 +38,13 @@ func NewClient(config domain.SNMPConfig) (*Client, error) {
 	client := &Client{
 		config: config,
 		snmp: &gosnmp.GoSNMP{
-			Target:    config.Host,
-			Port:      uint16(config.Port),
-			Community: config.Community,
-			Version:   gosnmp.Version2c,
-			Timeout:   time.Duration(config.Timeout) * time.Second,
-			Retries:   config.Retries,
+			Target:          config.Host,
+			Port:            uint16(config.Port),
+			Community:       config.Community,
+			Version:         gosnmp.Version2c,
+			Timeout:         time.Duration(config.Timeout) * time.Second,
+			Retries:         config.Retries,
+			MaxRepetitions:  3,
 		},
 	}
 
