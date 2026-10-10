@@ -23,21 +23,30 @@ import (
 type ONUService struct {
 	manager *OLTManager
 	cache   *cache.RedisCache
-	sfGroup singleflight.Group // deduplikasi request SNMP per OLT+board+pon
+	sfGroup  singleflight.Group // deduplikasi list per OLT+board+pon
+	sfDetail singleflight.Group // PATCH(oltwtch): dedup detail per OLT+board+pon+onu
+	sfLive   singleflight.Group // PATCH(oltwtch): dedup live per OLT+board+pon
+	hot      *HotTracker        // PATCH(oltwtch-2): tracker port panas (opsional)
 }
 
-// NewONUService creates a new ONU service
-func NewONUService(manager *OLTManager, cache *cache.RedisCache) *ONUService {
-	return &ONUService{
+// NewONUService creates a new ONU service.
+// Parameter hotTracker opsional (variadic) agar kode lama tetap kompil.
+func NewONUService(manager *OLTManager, cache *cache.RedisCache, hot ...*HotTracker) *ONUService {
+	s := &ONUService{
 		manager: manager,
 		cache:   cache,
 	}
+	if len(hot) > 0 {
+		s.hot = hot[0]
+	}
+	return s
 }
 
 // GetONUList retrieves list of ONUs on a specific PON port
 // Returns minimal data (ID, Name, Status) for fast response
 // Use GetONUDetail for complete ONU information
 func (s *ONUService) GetONUList(ctx context.Context, oltID string, board, pon int, forceFresh bool) ([]domain.ONUListItem, error) {
+	s.hot.Touch(oltID, board, pon) // PATCH(oltwtch-2): tandai port panas
 	// Check cache first (unless forced)
 	if s.cache != nil && !forceFresh {
 		cacheData, err := s.cache.GetONUList(ctx, oltID, board, pon)
@@ -97,7 +106,8 @@ func (s *ONUService) GetONUList(ctx context.Context, oltID string, board, pon in
 			return nil, err
 		}
 
-		release, err := s.manager.AcquireSNMPLock(ctx, oltID)
+		// PATCH(oltwtch): lock per-PON, bukan per-OLT
+		release, err := s.manager.AcquirePONLock(ctx, oltID, board, pon)
 		if err != nil {
 			return nil, err
 		}
@@ -157,27 +167,7 @@ func (s *ONUService) GetONUList(ctx context.Context, oltID string, board, pon in
 
 		// NOTE: Offline reason is intentionally not walked for list to keep it fast.
 
-		// 2. Walk Names
-		nameOID := snmp.BuildWalkOID(snmp.OIDONUName, ifIndex)
-		if results, err := client.BulkWalk(nameOID); err == nil {
-			for _, pdu := range results {
-				if id, err := extractONUID(pdu.Name, nameOID); err == nil {
-					getONU(id).Name = strings.TrimSpace(snmp.PduToString(&pdu))
-				}
-			}
-		}
-
-		// 3. Walk Serial Numbers
-		snOID := snmp.BuildWalkOID(snmp.OIDONUSerialNumber, ifIndex)
-		if results, err := client.BulkWalk(snOID); err == nil {
-			for _, pdu := range results {
-				if id, err := extractONUID(pdu.Name, snOID); err == nil {
-					getONU(id).SerialNumber = snmp.ParseSerialNumber(&pdu)
-				}
-			}
-		}
-
-		// 4. Walk RX Power
+		// 2. Walk RX Power (didahulukan — ini yang dibutuhkan real-time)
 		adapter, _ := s.manager.GetAdapter(oltID)
 		rxOID := snmp.BuildWalkOID(snmp.OIDONURXPower, ifIndex)
 		if results, err := client.BulkWalk(rxOID); err == nil {
@@ -188,6 +178,53 @@ func (s *ONUService) GetONUList(ctx context.Context, oltID string, board, pon in
 						getONU(id).RXPower = adapter.ConvertPower(raw)
 					} else {
 						getONU(id).RXPower = float64(raw-10000) / 100.0
+					}
+				}
+			}
+		}
+
+		// 3. Nama/Serial: coba dari names cache dulu (TTL 10 jam, diisi names
+		//    poller). Walk SNMP hanya untuk ONU yang namanya masih kosong.
+		//    PATCH(oltwtch-2): menghemat 2 walk di kasus umum.
+		needNames := false
+		if s.cache != nil {
+			if namesData, nErr := s.cache.GetONUNames(ctx, oltID, board, pon); nErr == nil {
+				var names []domain.ONUNameEntry
+				if json.Unmarshal(namesData, &names) == nil {
+					namesMap := make(map[int]domain.ONUNameEntry, len(names))
+					for _, n := range names {
+						namesMap[n.OnuID] = n
+					}
+					for id, onu := range onuMap {
+						if n, ok := namesMap[id]; ok {
+							onu.Name = n.Name
+							onu.SerialNumber = n.SerialNumber
+						}
+					}
+				}
+			}
+		}
+		for _, onu := range onuMap {
+			if onu.Name == "" {
+				needNames = true
+				break
+			}
+		}
+		if needNames {
+			nameOID := snmp.BuildWalkOID(snmp.OIDONUName, ifIndex)
+			if results, err := client.BulkWalk(nameOID); err == nil {
+				for _, pdu := range results {
+					if id, err := extractONUID(pdu.Name, nameOID); err == nil {
+						getONU(id).Name = strings.TrimSpace(snmp.PduToString(&pdu))
+					}
+				}
+			}
+
+			snOID := snmp.BuildWalkOID(snmp.OIDONUSerialNumber, ifIndex)
+			if results, err := client.BulkWalk(snOID); err == nil {
+				for _, pdu := range results {
+					if id, err := extractONUID(pdu.Name, snOID); err == nil {
+						getONU(id).SerialNumber = snmp.ParseSerialNumber(&pdu)
 					}
 				}
 			}
@@ -288,6 +325,7 @@ func extractONUID(fullOID, baseOID string) (int, error) {
 
 // GetONUDetail retrieves complete info for a single ONU
 func (s *ONUService) GetONUDetail(ctx context.Context, oltID string, board, pon, onuID int, forceFresh bool) (*domain.ONU, error) {
+	s.hot.Touch(oltID, board, pon) // PATCH(oltwtch-2): tandai port panas
 	// Check cache first (unless forced)
 	if s.cache != nil && !forceFresh {
 		cacheData, err := s.cache.GetONUDetail(ctx, oltID, board, pon, onuID)
@@ -301,23 +339,28 @@ func (s *ONUService) GetONUDetail(ctx context.Context, oltID string, board, pon,
 		}
 	}
 
-	client, err := s.manager.GetClient(oltID)
-	if err != nil {
-		return nil, err
-	}
+	// PATCH(oltwtch): deduplikasi via singleflight — 4 user klik ONU yang sama
+	// dalam waktu bersamaan = 1 batch SNMP, hasilnya dibagi ke semua.
+	sfKey := fmt.Sprintf("detail:%s:%d:%d:%d", oltID, board, pon, onuID)
+	v, err, _ := s.sfDetail.Do(sfKey, func() (interface{}, error) {
+		client, err := s.manager.GetClient(oltID)
+		if err != nil {
+			return nil, err
+		}
 
-	release, err := s.manager.AcquireSNMPLock(ctx, oltID)
-	if err != nil {
-		return nil, err
-	}
-	defer release()
+		// PATCH(oltwtch): lock per-PON, bukan per-OLT
+		release, err := s.manager.AcquirePONLock(ctx, oltID, board, pon)
+		if err != nil {
+			return nil, err
+		}
+		defer release()
 
-	start := time.Now()
+		start := time.Now()
 
-	adapter, _ := s.manager.GetAdapter(oltID)
-	ifIndex := snmp.CalculateIfIndex(1, board, pon)
+		adapter, _ := s.manager.GetAdapter(oltID)
+		ifIndex := snmp.CalculateIfIndex(1, board, pon)
 
-	// Batch GET — 1 SNMP round-trip вместо 10 sequential request
+		// Batch GET — 1 SNMP round-trip untuk 10 OID
 	oidName := snmp.BuildONUOID(snmp.OIDONUName, ifIndex, onuID, "")
 	oidSN := snmp.BuildONUOID(snmp.OIDONUSerialNumber, ifIndex, onuID, "")
 	oidType := snmp.BuildONUOID(snmp.OIDONUType, ifIndex, onuID, "")
@@ -398,14 +441,139 @@ func (s *ONUService) GetONUDetail(ctx context.Context, oltID string, board, pon,
 
 	onu.WanIp = getString(oidWanIp)
 
-	if s.cache != nil {
-		if data, err := json.Marshal(onu); err == nil {
-			ttl := adaptiveTTL(cache.TTLONUDetail, time.Since(start))
-			s.cache.SetONUDetailWithTTL(ctx, oltID, board, pon, onuID, data, ttl)
+		if s.cache != nil {
+			if data, err := json.Marshal(onu); err == nil {
+				ttl := adaptiveTTL(cache.TTLONUDetail, time.Since(start))
+				s.cache.SetONUDetailWithTTL(ctx, oltID, board, pon, onuID, data, ttl)
+			}
 		}
-	}
 
-	return onu, nil
+		return onu, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return v.(*domain.ONU), nil
+}
+
+// GetONULive — PATCH(oltwtch): jalur cepat khusus troubleshooting ("mode benerin").
+// Hanya walk 3 tabel: status + rx + tx. Nama/serial diambil dari cache (tidak berubah
+// saat teknisi lagi perbaiki). Dengan MaxRepetitions=50, satu PON port selesai dalam
+// ~2-4 detik, bukan belasan detik. Hasilnya juga ditulis ke cache list agar semua
+// user langsung melihat data segar.
+func (s *ONUService) GetONULive(ctx context.Context, oltID string, board, pon int) ([]domain.ONUListItem, error) {
+	s.hot.Touch(oltID, board, pon) // PATCH(oltwtch-2): tandai port panas
+	sfKey := fmt.Sprintf("live:%s:%d:%d", oltID, board, pon)
+	v, err, _ := s.sfLive.Do(sfKey, func() (interface{}, error) {
+		client, err := s.manager.GetClient(oltID)
+		if err != nil {
+			return nil, err
+		}
+
+		release, err := s.manager.AcquirePONLock(ctx, oltID, board, pon)
+		if err != nil {
+			return nil, err
+		}
+		defer release()
+
+		start := time.Now()
+		adapter, _ := s.manager.GetAdapter(oltID)
+		ifIndex := snmp.CalculateIfIndex(1, board, pon)
+
+		onuMap := make(map[int]*domain.ONUListItem)
+		getItem := func(id int) *domain.ONUListItem {
+			if _, ok := onuMap[id]; !ok {
+				onuMap[id] = &domain.ONUListItem{OltID: oltID, Board: board, Pon: pon, OnuID: id}
+			}
+			return onuMap[id]
+		}
+		convertPower := func(raw int) float64 {
+			if adapter != nil {
+				return adapter.ConvertPower(raw)
+			}
+			return float64(raw-10000) / 100.0
+		}
+
+		// 1. status (sekaligus discovery ONU)
+		statusOID := snmp.BuildWalkOID(snmp.OIDONUStatus, ifIndex)
+		statusResults, err := client.BulkWalk(statusOID)
+		if err != nil {
+			return nil, fmt.Errorf("walk status gagal: %w", err)
+		}
+		for _, pdu := range statusResults {
+			if id, err := extractONUID(pdu.Name, statusOID); err == nil {
+				it := getItem(id)
+				it.Status = snmp.ParseONUStatus(&pdu)
+				it.StatusCode = snmp.ParseStatusToInt(&pdu)
+			}
+		}
+		if len(onuMap) == 0 {
+			return []domain.ONUListItem{}, nil
+		}
+
+		// 2. rx power
+		rxOID := snmp.BuildWalkOID(snmp.OIDONURXPower, ifIndex)
+		if results, err := client.BulkWalk(rxOID); err == nil {
+			for _, pdu := range results {
+				if id, err := extractONUID(pdu.Name, rxOID); err == nil {
+					getItem(id).RXPower = convertPower(snmp.GetPDUInt(&pdu))
+				}
+			}
+		}
+
+		// 3. tx power
+		txOID := snmp.BuildWalkOID(snmp.OIDONUTXPower, ifIndex)
+		if results, err := client.BulkWalk(txOID); err == nil {
+			for _, pdu := range results {
+				if id, err := extractONUID(pdu.Name, txOID); err == nil {
+					getItem(id).TXPower = convertPower(snmp.GetPDUInt(&pdu))
+				}
+			}
+		}
+
+		// 4. nama/serial dari cache saja — tanpa walk
+		if s.cache != nil {
+			if namesData, nErr := s.cache.GetONUNames(ctx, oltID, board, pon); nErr == nil {
+				var names []domain.ONUNameEntry
+				if json.Unmarshal(namesData, &names) == nil {
+					namesMap := make(map[int]domain.ONUNameEntry, len(names))
+					for _, n := range names {
+						namesMap[n.OnuID] = n
+					}
+					for id, it := range onuMap {
+						if n, ok := namesMap[id]; ok {
+							it.Name = n.Name
+							it.SerialNumber = n.SerialNumber
+						}
+					}
+				}
+			}
+		}
+
+		items := make([]domain.ONUListItem, 0, len(onuMap))
+		for _, it := range onuMap {
+			items = append(items, *it)
+		}
+		sort.Slice(items, func(i, j int) bool { return items[i].OnuID < items[j].OnuID })
+
+		// tulis ke cache list: semua user dapat data segar tanpa walk ulang
+		if s.cache != nil && len(items) > 0 {
+			if data, mErr := json.Marshal(items); mErr == nil {
+				ttl := adaptiveTTL(cache.TTLONUList, time.Since(start))
+				if err := s.cache.SetONUListWithTTL(ctx, oltID, board, pon, data, ttl); err != nil {
+					log.Warn().Err(err).Msg("Gagal cache hasil live")
+				}
+			}
+		}
+
+		log.Debug().Int("count", len(items)).Dur("dur", time.Since(start)).
+			Msg("Live refresh selesai")
+		return items, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return v.([]domain.ONUListItem), nil
 }
 
 // GetPONList retrieves list of PONs with descriptions for a specific board

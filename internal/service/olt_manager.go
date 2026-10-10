@@ -131,12 +131,25 @@ func (m *OLTManager) UnregisterOLT(ctx context.Context, oltID string) error {
 }
 
 // AcquireSNMPLock serializes SNMP operations per OLT to avoid contention
+// (dipakai untuk operasi level OLT: system info, indexer).
 func (m *OLTManager) AcquireSNMPLock(ctx context.Context, oltID string) (func(), error) {
+	return m.acquireLock(ctx, "olt:"+oltID)
+}
+
+// PATCH(oltwtch): AcquirePONLock — lock per PON port, bukan per OLT.
+// User di PON 1/2/3 tidak lagi diblokir user di PON 1/2/4. Satu PON port
+// tetap serial (melindungi OLT dari walk ganda ke port yang sama),
+// tapi port yang berbeda jalan paralel.
+func (m *OLTManager) AcquirePONLock(ctx context.Context, oltID string, board, pon int) (func(), error) {
+	return m.acquireLock(ctx, fmt.Sprintf("pon:%s/%d/%d", oltID, board, pon))
+}
+
+func (m *OLTManager) acquireLock(ctx context.Context, key string) (func(), error) {
 	m.mu.Lock()
-	lock, ok := m.opLocks[oltID]
+	lock, ok := m.opLocks[key]
 	if !ok {
 		lock = make(chan struct{}, 1)
-		m.opLocks[oltID] = lock
+		m.opLocks[key] = lock
 	}
 	m.mu.Unlock()
 

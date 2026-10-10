@@ -16,11 +16,12 @@ func (c *OLTConfig) ResolvedSNMPConfig(id string) domain.SNMPConfig {
 	}
 
 	return domain.SNMPConfig{
-		Host:      c.Host,
-		Port:      c.Port,
-		Community: community,
-		Timeout:   c.Timeout,
-		Retries:   c.Retries,
+		Host:           c.Host,
+		Port:           c.Port,
+		Community:      community,
+		Timeout:        c.Timeout,
+		Retries:        c.Retries,
+		MaxRepetitions: c.MaxRepetitions,
 	}
 }
 

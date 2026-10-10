@@ -140,6 +140,55 @@ func (h *ONUHandler) GetONUDetail(w http.ResponseWriter, r *http.Request) {
 	Success(w, onu)
 }
 
+// GetONULive returns FRESH status + rx/tx for a whole PON port, fast.
+// PATCH(oltwtch): GET /api/v1/olt/{oltId}/board/{board}/pon/{pon}/live
+// "Mode benerin": teknisi butuh tahu detik ini juga apakah ONU sudah up dan
+// redamannya berapa — tanpa menunggu cache, tanpa antre di belakang user lain.
+func (h *ONUHandler) GetONULive(w http.ResponseWriter, r *http.Request) {
+	oltID := chi.URLParam(r, "oltId")
+	boardStr := chi.URLParam(r, "board")
+	ponStr := chi.URLParam(r, "pon")
+
+	if oltID == "" {
+		BadRequest(w, "OLT ID is required")
+		return
+	}
+	board, err := strconv.Atoi(boardStr)
+	if err != nil || board < 1 {
+		BadRequest(w, "Invalid board number")
+		return
+	}
+	pon, err := strconv.Atoi(ponStr)
+	if err != nil || pon < 1 {
+		BadRequest(w, "Invalid PON number")
+		return
+	}
+
+	log.Debug().Str("oltId", oltID).Int("board", board).Int("pon", pon).Msg("Live refresh PON")
+
+	// Timeout lebih pendek dari list biasa: live path memang dirancang cepat.
+	// Kalau sampai timeout, berarti OLT sedang berat — jangan dipaksa.
+	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
+	defer cancel()
+
+	onus, err := h.onuService.GetONULive(ctx, oltID, board, pon)
+	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
+			Error(w, http.StatusGatewayTimeout, "OLT sibuk, coba lagi beberapa detik")
+			return
+		}
+		if errors.Is(err, domain.ErrOLTNotFound) {
+			NotFound(w, "OLT not found")
+			return
+		}
+		log.Error().Err(err).Msg("Failed live refresh")
+		InternalError(w, "Live refresh gagal: "+err.Error())
+		return
+	}
+
+	Success(w, onus)
+}
+
 // GetPONList returns list of PONs with descriptions
 // GET /api/v1/olt/{oltId}/board/{board}/pon
 func (h *ONUHandler) GetPONList(w http.ResponseWriter, r *http.Request) {

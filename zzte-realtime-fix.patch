@@ -1,0 +1,2645 @@
+diff --git a/API.md b/API.md
+index ba4bb81..17e4434 100644
+--- a/API.md
++++ b/API.md
+@@ -544,6 +544,7 @@ Returns lightweight list of ONUs on a PON port (only essential fields).
+ | status | string | Human-readable status |
+ | statusCode | int | Numeric status code (see Status Codes table) |
+ | rxPower | float | RX power in dBm |
++| txPower | float | TX power in dBm (added: realtime patch) |
+ 
+ **Cache Behavior (3-level fallback):**
+ 1. Complete list cache (Name populated) → returns in < 100ms
+@@ -552,6 +553,23 @@ Returns lightweight list of ONUs on a PON port (only essential fields).
+ 
+ ---
+ 
++### Get ONU Live (realtime troubleshooting)
++
++```
++GET /api/v1/olt/{oltId}/board/{board}/pon/{pon}/live
++```
++
++Fresh per-PON status + Rx/Tx in one call (~1-5s depending on ONU count).
++Names/serials served from cache (no extra walks). Use for ODP
++troubleshooting instead of waiting for the background poller.
++Concurrent identical requests are de-duplicated (singleflight).
++
++**URL Parameters:** same as Get ONU List.
++
++**Response 200:** same shape as Get ONU List (includes `txPower`).
++
++---
++
+ ### Get ONU Detail
+ 
+ ```
+@@ -628,6 +646,69 @@ GET /api/v1/olt/{oltId}/board/{board}/pon
+ 
+ ---
+ 
++## Event & Alert (up/down via syslog/trap — zero OLT polling)
++
++Event-driven ONU up/down. The OLT pushes events (syslog UDP 514 or SNMP
++trap UDP 162); zzte never polls for status on this path. Down causes are
++classified: `dying-gasp` = customer power, `los` = fiber, `unknown` otherwise.
++
++### Stream Events (SSE realtime)
++
++```
++GET /api/v1/events/stream
++```
++
++Server-Sent Events. Emits `event: onu` (raw up/down) and `event: alert`
++(anti-spam filtered). Includes `: ping` heartbeat every 25s.
++
++```
++event: onu
++data: {"oltId":"olt_1","board":1,"pon":2,"onuId":4,"kind":"down","cause":"los",...}
++
++event: alert
++data: {"id":"...","kind":"down","severity":"warning","message":"DOWN: olt_1 1/2:4 — ...",...}
++```
++
++### Recent Events
++
++```
++GET /api/v1/events/recent?limit=50
++```
++
++**Query Parameters:**
++
++| Param | Type | Description |
++|-------|------|-------------|
++| `limit` | int | Max entries (default 50, max 500, newest first) |
++
++### Alerts (anti-spam, for frontend)
++
++```
++GET /api/v1/alerts?limit=50
++```
++
++Down events after anti-spam filtering: 90s aggregation window, mass-down
++(≥5 ONUs per PON in window) collapsed into one alert, per-ONU cooldown
++60 min. Dying-gasp (power) reported with `info` severity instead of being
++paged as urgent.
++
++**Alert Fields:**
++
++| Field | Type | Description |
++|-------|------|-------------|
++| id | string | Alert ID |
++| oltId / board / pon / onuId | mixed | Location (`onuId: 0` = mass-down) |
++| kind | string | `down` \| `mass-down` |
++| cause | string | `power` \| `los` \| `unknown` \| `mass` |
++| count | int | ONU count (mass-down only) |
++| severity | string | `critical` (mass-down) \| `warning` (los/unknown) \| `info` (power) |
++| message | string | Human-readable (Indonesian) |
++| createdAt | string | ISO timestamp |
++
++**Query Parameters:** same `limit` semantics as Recent Events.
++
++---
++
+ ## Control
+ 
+ ### Reboot ONU (Telnet)
+diff --git a/README.md b/README.md
+index e13b3c2..88d52e1 100644
+--- a/README.md
++++ b/README.md
+@@ -57,13 +57,25 @@ search:
+   interval: 0        # interval dalam menit
+ 
+ optical_poller:
+-  enabled: true       # polling status + rx power
+-  interval: 60        # detik
++  enabled: true       # polling status + rx power (jaring pengaman; realtime via /live & syslog)
++  interval: 600       # detik (10 menit — 60 dtk menyiksa OLT)
+ 
+ names_poller:
+   enabled: true       # polling nama + serial number
+   interval: 28800      # detik (8 jam)
+ 
++event:
++  syslog:
++    enabled: false    # true bila OLT sudah dikonfigurasi kirim syslog ke server ini
++    port: 514         # butuh root/capability; alternatif: port bebas + DNAT
++    sources:          # opsional: IP pengirim -> oltID (kosong = fallback ke host SNMP OLT terdaftar)
++      # "192.168.1.100": "olt_1"
++  alert:
++    cooldown_minutes: 60    # 1 ONU max 1 alert per 60 menit
++    agg_window_seconds: 90   # kumpulkan down 90 dtk sebelum jadi alert
++    mass_threshold: 5        # >=5 down/PON dalam window = 1 alert mass-down
++    reverify: true            # verifikasi ulang status ONU via SNMP GET sebelum alert (anti false-alarm saat flapping)
++
+ olts:
+   olt_1:
+     name: "ZTE C320"
+@@ -72,6 +84,9 @@ olts:
+     community: "public"
+     timeout: 5
+     retries: 2
++    max_repetitions: 0   # baris per BULK request; 0 = default aman (20).
++                         # C320/C300 rawan snmpwalk: jangan asal besar —
++                         # response PDU raksasa bikin CPU control-plane spike.
+     poll_interval: 120   # detik, 0 = pakai global
+     telnet:
+       user: "zte"
+@@ -274,6 +289,14 @@ curl http://localhost:8081/api/v1/olt/olt_1/board/1/pon/2
+ | `fresh=true` | bool | Skip cache, force on-demand SNMP walk |
+ | `refresh=true` | bool | Sama seperti `fresh=true` |
+ 
++#### Get ONU Live (jalur cepat troubleshooting)
++
++Satu PON port: status + Rx/Tx segar (±2–4 dtk), nama/SN dari cache. Untuk troubleshooting ODP tanpa menunggu poller dan tanpa menyiksa OLT.
++
++```bash
++curl http://localhost:8081/api/v1/olt/olt_1/board/1/pon/2/live
++```
++
+ #### Get ONU Detail
+ 
+ ```bash
+@@ -314,6 +337,28 @@ curl http://localhost:8081/api/v1/olt/olt_1/info
+ curl http://localhost:8081/api/v1/olt/olt_1/health
+ ```
+ 
++### Event & Alert (up/down via syslog — nol beban OLT)
++
++Aktifkan dulu di OLT (arahkan syslog ke IP:port server ini) dan `event.syslog.enabled: true`.
++Klasifikasi penyebab down otomatis: `dying-gasp` = listrik pelanggan, `los` = fiber.
++
++```bash
++# Alert down yang lolos anti-spam (untuk ditampilkan frontend)
++curl http://localhost:8081/api/v1/alerts?limit=50
++
++# Response: [{id, oltId, board, pon, onuId, kind: "down"|"mass-down",
++#             cause, count, severity: "critical"|"warning"|"info",
++#             message, createdAt}]
++
++# Event log terakhir
++curl http://localhost:8081/api/v1/events/recent?limit=50
++
++# Stream realtime (Server-Sent Events): event: onu | event: alert
++curl -N http://localhost:8081/api/v1/events/stream
++```
++
++Lihat [ROADMAP.md](ROADMAP.md) untuk status pengerjaan & langkah berikutnya.
++
+ ## SNMP OID Reference
+ 
+ | Data | OID |
+diff --git a/ROADMAP.md b/ROADMAP.md
+new file mode 100644
+index 0000000..514aea9
+--- /dev/null
++++ b/ROADMAP.md
+@@ -0,0 +1,48 @@
++# Roadmap — zzte realtime & event-driven
++
++> Status jujur per 2026-10-09. "Selesai" = kode ada di patch + lolos build & unit test di sandbox.
++> **Belum ada yang diuji ke OLT asli.**
++
++## ✅ Selesai (di patch, sandbox-tested)
++
++### Batch 1 — Realtime troubleshooting
++- `GET /live` per PON port: status + Rx/Tx segar (±2–4 dtk/port, estimasi), nama/SN dari cache
++- Lock SNMP per-PON (ganti lock se-OLT), `MaxRepetitions` 3 → **20** (bukan 50: agen SNMP C320/C300 rawan — response PDU raksasa bikin CPU control-plane spike; 20 = titik aman, bisa override per OLT via `max_repetitions`)
++- Singleflight dedup untuk request ONU detail & /live yang bersamaan
++- Poller optical 60 dtk → 10 mnt + anti-overlap (data realtime diambil via /live, bukan poller)
++- `ONUListItem` dapat field `txPower`
++
++### Batch 2 — Proteksi OLT
++- `HotTracker`: port yang baru dibuka user = "panas", dipoll tiap siklus; port dingin tiap 6 siklus **dengan stagger** (rotasi deterministik per port, bukan borongan — mencegah ledakan beban 6x tiap siklus ke-6 yang memicu degraded mode di port padat, temuan simulasi)
++- Circuit-breaker + backoff saat OLT error
++- `GetONUList` baca nama/SN dari cache dulu (2 walk SNMP dihemat bila cache ada)
++
++### Batch 3 — Event-driven up/down via syslog (nol beban OLT)
++- UDP syslog listener (port 514, configurable), parser ZTE: klasifikasi `dying-gasp` (power) vs `LOS` (fiber)
++- Event bus + dedup 60 dtk, mapper IP pengirim → oltID (multi-OLT, otomatis fallback ke host SNMP terdaftar)
++- Status ONU di-patch langsung di cache Redis → dashboard segar detik itu juga
++- `GET /api/v1/events/stream` (SSE realtime), `GET /api/v1/events/recent`
++- Alert engine anti-spam (agregasi 90 dtk, mass-down ≥5 → 1 alert, cooldown 60 mnt/ONU, severity critical/warning/info) → `GET /api/v1/alerts`
++- **Verifikasi ulang sebelum alert (anti false-alarm flapping):** di momen batch-flush, setiap calon alert di-verify via satu SNMP GET terarah ke OID status ONU (`...3.28.2.1.4`); yang sudah kembali online dibuang. Mass-down yang sebagian pulih turun jadi alert per-ONU untuk yang masih down. Aktif via `event.alert.reverify` (default `true`); SNMP error → trust syslog (alert tetap keluar). Di-test dengan 6 unit test baru di `internal/event/alert_test.go`.
++
++## ⏳ Menunggu (butuh aksi manusia)
++
++- [ ] **Apply patch** ke repo (`git apply --check` → `git apply`), `go build ./...`
++- [ ] **Config OLT**: arahkan syslog ke IP:port zzte; pastikan alarm `onu-dying-gasp`, `onu-deregister`, `onu-link-lost` aktif
++- [ ] **Config zzte**: `event.syslog.enabled: true` (default `false`, aman bila OLT belum dikonfigurasi)
++- [ ] **Uji OLT asli**: cabut-colok 1 ONU → event masuk? klasifikasi cause benar? (kirim contoh baris syslog asli bila ada yang tak ter-parse — pola bisa beda antar firmware)
++- [ ] **Uji beban**: 4+ user simultan di PON berbeda + sama; pantau CPU/memory OLT sebelum naikkan konkurensi
++- [ ] **Integrasi frontend**: konsumsi `GET /api/v1/alerts` (polling) atau SSE `/api/v1/events/stream` (`event: alert`)
++
++## 🔮 Berikutnya (belum dikerjakan)
++
++- **History & trending redaman** per ONU (grafik naik/turun, alert prediktif 3 dB/minggu warning, 5 dB/minggu critical) — pembeda utama vs NMS generik
++- Notifikasi WhatsApp (opsional, di atas `/alerts`)
++- Vendor OLT selain ZTE (arsitektur sudah vendor-agnostic di level event)
++- Kalibrasi skala nilai optik & OID per versi firmware
++
++## Prinsip yang dipegang
++
++1. **Jangan bebani OLT.** Status up/down = event-driven (OLT didengarkan, tidak ditanya). Polling hanya untuk data optik, ringan & terjadwal.
++2. **Multi-OLT sejak awal.** Semua event membawa oltID.
++3. **Anti-spam.** Teknisi dapat 1 info yang jelas, bukan 50 notifikasi.
+diff --git a/cmd/main.go b/cmd/main.go
+index e701cb7..361ac09 100644
+--- a/cmd/main.go
++++ b/cmd/main.go
+@@ -12,10 +12,12 @@ import (
+ 
+ 	"olt-monitor/internal/cache"
+ 	"olt-monitor/internal/config"
++	"olt-monitor/internal/event"
+ 	"olt-monitor/internal/handler"
+ 	"olt-monitor/internal/poller"
+ 	"olt-monitor/internal/server"
+ 	"olt-monitor/internal/service"
++	"olt-monitor/internal/snmp"
+ )
+ 
+ func main() {
+@@ -59,7 +61,10 @@ func main() {
+ 	}
+ 
+ 	// Create services
+-	onuService := service.NewONUService(manager, redisCache)
++	// PATCH(oltwtch-2): tracker port panas — dipakai service (menandai) dan
++	// poller (memprioritaskan). Lihat internal/service/hot_tracker.go.
++	hotTracker := service.NewHotTracker()
++	onuService := service.NewONUService(manager, redisCache, hotTracker)
+ 	indexerService := service.NewIndexerService(manager, redisCache, cfg)
+ 
+ 	// Context untuk graceful shutdown
+@@ -69,7 +74,7 @@ func main() {
+ 	// Start optical poller jika enabled
+ 	var opticalPoller *poller.OpticalPoller
+ 	if cfg.OpticalPoller.Enabled {
+-		opticalPoller = poller.NewOpticalPoller(manager, redisCache, cfg)
++		opticalPoller = poller.NewOpticalPoller(manager, redisCache, cfg, hotTracker)
+ 		opticalPoller.Start(ctx)
+ 		log.Info().Int("interval", cfg.OpticalPoller.Interval).Msg("Optical poller started")
+ 	}
+@@ -87,6 +92,73 @@ func main() {
+ 		indexerService.StartBackgroundSync(time.Duration(cfg.Search.Interval) * time.Minute)
+ 	}
+ 
++	// PATCH(oltwtch-event): jalur event-driven via syslog dari OLT.
++	// PRINSIP: OLT hanya didengarkan, tidak ditanya — nol beban polling/status.
++	// Multi-OLT: IP pengirim di-resolve ke oltID (config eksplisit atau
++	// fallback ke host SNMP OLT terdaftar).
++	eventBus := event.NewBus(1024)
++	eventBus.Start()
++	defer eventBus.Close()
++
++	eventMapper := event.NewMapper(manager)
++	eventMapper.SetSources(cfg.Event.Syslog.Sources)
++
++	// Sink Redis: patch status instan + pub/sub realtime + event log.
++	eventSink := event.NewSink(redisCache)
++	eventBus.Subscribe(eventSink.Handle)
++
++	// PATCH(oltwtch-alert): mesin alert — event down yang lolos anti-spam
++	// (agregasi + cooldown) disimpan di Redis dan diekspos via
++	// GET /api/v1/alerts untuk ditampilkan frontend. Tanpa WA.
++	alertEngine := event.NewEngine(event.AlertConfig{
++		Cooldown:      time.Duration(cfg.Event.Alert.CooldownMinutes) * time.Minute,
++		AggWindow:     time.Duration(cfg.Event.Alert.AggWindowSeconds) * time.Second,
++		MassThreshold: cfg.Event.Alert.MassThreshold,
++	}, redisCache)
++	if cfg.Event.Alert.Reverify {
++		// PATCH(oltwtch-alert): verifikasi ulang status ONU tepat sebelum
++		// alert diterbitkan — satu SNMP GET terarah, bukan polling.
++		// Kalau ONU sudah online lagi (status 3), alert dibuang: ini
++		// menutup false-alarm klasik saat syslog LOS tapi ONU sudah
++		// kembali up. Kesalahan SNMP -> trust syslog (alert tetap keluar).
++		alertEngine.SetVerifier(func(ev event.Event) bool {
++			cl, err := manager.GetNewClient(ev.OLTID)
++			if err != nil {
++				return true
++			}
++			if err := cl.Connect(); err != nil {
++				return true
++			}
++			defer cl.Close()
++			ifIndex := snmp.CalculateIfIndexDefault(ev.Board, ev.Pon)
++			oid := snmp.BuildONUOID(snmp.OIDONUStatus, ifIndex, ev.OnuID, "")
++			st, err := cl.GetInt(oid)
++			if err != nil {
++				return true
++			}
++			return st != 3 // 3 = online
++		})
++	}
++	eventBus.Subscribe(alertEngine.Handle)
++	alertEngine.Start()
++	defer alertEngine.Stop()
++	log.Info().Msg("Alert engine aktif (anti-spam: agregasi + cooldown, via /api/v1/alerts)")
++
++	var syslogStop chan struct{}
++	if cfg.Event.Syslog.Enabled {
++		syslogStop = make(chan struct{})
++		syslogSrv := event.NewServer(eventBus, eventMapper, cfg.Event.Syslog.Port)
++		go func() {
++			if err := syslogSrv.Serve(syslogStop); err != nil {
++				log.Error().Err(err).Msg("Syslog server berhenti dengan error")
++			}
++		}()
++		log.Info().Int("port", cfg.Event.Syslog.Port).
++			Msg("Syslog listener aktif — arahkan syslog OLT ke IP:port ini")
++	} else {
++		log.Info().Msg("Event syslog nonaktif (event.syslog.enabled=false)")
++	}
++
+ 	// Setup HTTP server
+ 	router := handler.SetupRoutes(cfg, manager, onuService, indexerService, redisCache)
+ 	srv := server.NewServer(cfg, router)
+@@ -100,6 +172,9 @@ func main() {
+ 
+ 		cancel() // Batalkan context poller
+ 
++		if syslogStop != nil {
++			close(syslogStop)
++		}
+ 		if opticalPoller != nil {
+ 			opticalPoller.Stop()
+ 		}
+diff --git a/internal/cache/redis.go b/internal/cache/redis.go
+index 64f8622..6335df9 100644
+--- a/internal/cache/redis.go
++++ b/internal/cache/redis.go
+@@ -8,6 +8,8 @@ import (
+ 
+ 	"github.com/redis/go-redis/v9"
+ 	"github.com/rs/zerolog/log"
++
++	"olt-monitor/internal/domain"
+ )
+ 
+ // TTL constants for different cache types
+@@ -32,6 +34,13 @@ const (
+ 	KeyPONList     = "olt:%s:board:%d:pon:list"
+ 	KeyOLTPattern  = "olt:%s:*"
+ 	KeyActivityLog = "activity:log"
++	// PATCH(oltwtch-event): kunci event-driven
++	KeyEventBus  = "zzte:events"     // pub/sub channel
++	KeyEventLog  = "zzte:events:log" // list terbatas
++	KeyAlertBus  = "zzte:alerts"     // pub/sub channel alert
++	KeyAlertLog  = "zzte:alerts:log" // list alert terbatas
++	MaxEventEntries = 500
++	MaxAlertEntries = 500
+ )
+ 
+ // RedisCache wraps Redis client with OLT-specific operations
+@@ -274,3 +283,134 @@ func (c *RedisCache) SetJSON(ctx context.Context, key string, value interface{},
+ func (c *RedisCache) Ping(ctx context.Context) error {
+ 	return c.client.Ping(ctx).Err()
+ }
++
++// ---- PATCH(oltwtch-event): method untuk jalur event-driven ----
++
++// PublishEvent publikasikan event ke pub/sub untuk dashboard realtime (SSE).
++func (c *RedisCache) PublishEvent(ctx context.Context, data []byte) error {
++	return c.client.Publish(ctx, KeyEventBus, data).Err()
++}
++
++// SubscribeEvents kembalikan channel pub/sub. Tutup via close().
++func (c *RedisCache) SubscribeEvents(ctx context.Context) (<-chan []byte, func()) {
++	sub := c.client.Subscribe(ctx, KeyEventBus)
++	ch := make(chan []byte, 128)
++	go func() {
++		defer close(ch)
++		for msg := range sub.Channel() {
++			select {
++			case ch <- []byte(msg.Payload):
++			default:
++			}
++		}
++	}()
++	return ch, func() { sub.Close() }
++}
++
++// AppendEventLog simpan event ke log terbatas (LPush + LTrim).
++func (c *RedisCache) AppendEventLog(ctx context.Context, data []byte) error {
++	pipe := c.client.Pipeline()
++	pipe.LPush(ctx, KeyEventLog, data)
++	pipe.LTrim(ctx, KeyEventLog, 0, MaxEventEntries-1)
++	_, err := pipe.Exec(ctx)
++	return err
++}
++
++// RecentEvents ambil N event terakhir (terbaru dulu).
++func (c *RedisCache) RecentEvents(ctx context.Context, limit int) ([][]byte, error) {
++	if limit <= 0 || limit > MaxEventEntries {
++		limit = 50
++	}
++	strs, err := c.client.LRange(ctx, KeyEventLog, 0, int64(limit-1)).Result()
++	if err != nil {
++		return nil, err
++	}
++	out := make([][]byte, 0, len(strs))
++	for _, s := range strs {
++		out = append(out, []byte(s))
++	}
++	return out, nil
++}
++
++// PublishAlert publikasikan alert ke pub/sub untuk dashboard realtime.
++func (c *RedisCache) PublishAlert(ctx context.Context, data []byte) error {
++	return c.client.Publish(ctx, KeyAlertBus, data).Err()
++}
++
++// SubscribeAlerts kembalikan channel pub/sub alert. Tutup via close().
++func (c *RedisCache) SubscribeAlerts(ctx context.Context) (<-chan []byte, func()) {
++	sub := c.client.Subscribe(ctx, KeyAlertBus)
++	ch := make(chan []byte, 128)
++	go func() {
++		defer close(ch)
++		for msg := range sub.Channel() {
++			select {
++			case ch <- []byte(msg.Payload):
++			default:
++			}
++		}
++	}()
++	return ch, func() { sub.Close() }
++}
++
++// AppendAlert simpan alert ke log terbatas (LPush + LTrim).
++func (c *RedisCache) AppendAlert(ctx context.Context, data []byte) error {
++	pipe := c.client.Pipeline()
++	pipe.LPush(ctx, KeyAlertLog, data)
++	pipe.LTrim(ctx, KeyAlertLog, 0, MaxAlertEntries-1)
++	_, err := pipe.Exec(ctx)
++	return err
++}
++
++// RecentAlerts ambil N alert terakhir (terbaru dulu).
++func (c *RedisCache) RecentAlerts(ctx context.Context, limit int) ([][]byte, error) {
++	if limit <= 0 || limit > MaxAlertEntries {
++		limit = 50
++	}
++	strs, err := c.client.LRange(ctx, KeyAlertLog, 0, int64(limit-1)).Result()
++	if err != nil {
++		return nil, err
++	}
++	out := make([][]byte, 0, len(strs))
++	for _, s := range strs {
++		out = append(out, []byte(s))
++	}
++	return out, nil
++}
++
++// PatchONUStatus update status 1 ONU di cache list PON (read-modify-write).
++// Dipakai jalur event agar dashboard langsung segar tanpa walk SNMP.
++// Bila cache kosong, kembalikan redis.Nil (poller yang akan mengisi).
++func (c *RedisCache) PatchONUStatus(ctx context.Context, oltID string, board, pon, onuID int, status string, statusCode int) error {
++	key := fmt.Sprintf(KeyONUList, oltID, board, pon)
++	data, err := c.client.Get(ctx, key).Bytes()
++	if err != nil {
++		return err
++	}
++	var items []domain.ONUListItem
++	if err := json.Unmarshal(data, &items); err != nil {
++		return err
++	}
++	found := false
++	for i := range items {
++		if items[i].OnuID == onuID {
++			items[i].Status = status
++			items[i].StatusCode = statusCode
++			found = true
++			break
++		}
++	}
++	if !found {
++		return fmt.Errorf("onu %d tidak ada di cache list", onuID)
++	}
++	ttl, err := c.client.TTL(ctx, key).Result()
++	if err != nil || ttl <= 0 {
++		ttl = TTLONUList
++	}
++	return c.SetONUListWithTTL(ctx, oltID, board, pon, mustJSON(items), ttl)
++}
++
++func mustJSON(v interface{}) []byte {
++	data, _ := json.Marshal(v)
++	return data
++}
+diff --git a/internal/config/config.go b/internal/config/config.go
+index cac2dc4..30ea4f7 100644
+--- a/internal/config/config.go
++++ b/internal/config/config.go
+@@ -16,6 +16,7 @@ type Config struct {
+ 	Search        SearchConfig           `mapstructure:"search"`
+ 	OpticalPoller OpticalPollerConfig    `mapstructure:"optical_poller"`
+ 	NamesPoller   NamesPollerConfig      `mapstructure:"names_poller"`
++	Event         EventConfig            `mapstructure:"event"`
+ 	OLTs          map[string]OLTConfig   `mapstructure:"olts"`
+ 	Users         map[string]UserAccount `mapstructure:"users"`
+ 	v             *viper.Viper
+@@ -33,6 +34,31 @@ type NamesPollerConfig struct {
+ 	Interval int  `mapstructure:"interval"` // dalam detik
+ }
+ 
++// EventConfig konfigurasi jalur event-driven (syslog dari OLT).
++// Prinsip: OLT hanya didengarkan, tidak ditanya — nol beban polling.
++type EventConfig struct {
++	Syslog EventSyslogConfig `mapstructure:"syslog"`
++	Alert  EventAlertConfig  `mapstructure:"alert"`
++}
++
++// EventSyslogConfig: UDP listener untuk syslog OLT.
++type EventSyslogConfig struct {
++	Enabled bool              `mapstructure:"enabled"`
++	Port    int               `mapstructure:"port"` // default 514; butuh root/capability
++	Sources map[string]string `mapstructure:"sources"`
++	// sources: IP pengirim -> oltID, mis. {"192.168.1.100": "olt-jkt"}.
++	// Kosong = fallback otomatis ke host SNMP OLT terdaftar.
++}
++
++// EventAlertConfig: alert down anti-spam, diekspos via GET /api/v1/alerts
++// untuk ditampilkan frontend (tanpa ketergantungan layanan pihak ketiga).
++type EventAlertConfig struct {
++	CooldownMinutes  int  `mapstructure:"cooldown_minutes"`
++	AggWindowSeconds int  `mapstructure:"agg_window_seconds"`
++	MassThreshold    int  `mapstructure:"mass_threshold"`
++	Reverify         bool `mapstructure:"reverify"` // SNMP GET status sebelum alert (anti false-alarm flapping)
++}
++
+ // ServerConfig holds application settings
+ type ServerConfig struct {
+ 	Port      int    `mapstructure:"port"`
+@@ -63,6 +89,9 @@ type OLTConfig struct {
+ 	Community    string            `mapstructure:"community"`
+ 	Timeout      int               `mapstructure:"timeout"`
+ 	Retries      int               `mapstructure:"retries"`
++	// MaxRepetitions: baris per BULK request. 0 = default aman (20).
++	// Naikkan hanya bila OLT terbukti kuat; C320/C300 yang rawan jangan.
++	MaxRepetitions int             `mapstructure:"max_repetitions"`
+ 	PollInterval int               `mapstructure:"poll_interval"` // detik, 0 = pakai global
+ 	Telnet       TelnetConfig      `mapstructure:"telnet"`
+ 	VlanProfiles map[string]string `mapstructure:"vlan_profiles"`
+@@ -95,9 +124,20 @@ func Load(path string) (*Config, error) {
+ 	v.SetDefault("search.enabled", false)
+ 	v.SetDefault("search.interval", 0)
+ 	v.SetDefault("optical_poller.enabled", true)
+-	v.SetDefault("optical_poller.interval", 60)
++	// PATCH(oltwtch): 60 -> 600. Poller 60 detik menumpuk (satu siklus
++	// 32 PON port bisa >60 detik) dan menyiksa OLT. Data real-time saat
++	// troubleshooting diambil via endpoint /live, bukan dari poller.
++	v.SetDefault("optical_poller.interval", 600)
+ 	v.SetDefault("names_poller.enabled", true)
+ 	v.SetDefault("names_poller.interval", 28800)
++	// PATCH(oltwtch-event): jalur event-driven via syslog (default nonaktif
++	// sampai OLT dikonfigurasi mengirim syslog ke server ini).
++	v.SetDefault("event.syslog.enabled", false)
++	v.SetDefault("event.syslog.port", 514)
++	v.SetDefault("event.alert.cooldown_minutes", 60)
++	v.SetDefault("event.alert.agg_window_seconds", 90)
++	v.SetDefault("event.alert.mass_threshold", 5)
++	v.SetDefault("event.alert.reverify", true)
+ 
+ 	// Config file
+ 	v.SetConfigName("olt_config")
+diff --git a/internal/config/olt_runtime.go b/internal/config/olt_runtime.go
+index d9cf645..53a5f9d 100644
+--- a/internal/config/olt_runtime.go
++++ b/internal/config/olt_runtime.go
+@@ -16,11 +16,12 @@ func (c *OLTConfig) ResolvedSNMPConfig(id string) domain.SNMPConfig {
+ 	}
+ 
+ 	return domain.SNMPConfig{
+-		Host:      c.Host,
+-		Port:      c.Port,
+-		Community: community,
+-		Timeout:   c.Timeout,
+-		Retries:   c.Retries,
++		Host:           c.Host,
++		Port:           c.Port,
++		Community:      community,
++		Timeout:        c.Timeout,
++		Retries:        c.Retries,
++		MaxRepetitions: c.MaxRepetitions,
+ 	}
+ }
+ 
+diff --git a/internal/domain/olt.go b/internal/domain/olt.go
+index fbe49ad..be6b8aa 100644
+--- a/internal/domain/olt.go
++++ b/internal/domain/olt.go
+@@ -11,6 +11,11 @@ type SNMPConfig struct {
+ 	Community string `json:"community"`
+ 	Timeout   int    `json:"timeout,omitempty"` // seconds, default 5
+ 	Retries   int    `json:"retries,omitempty"` // default 2
++	// MaxRepetitions jumlah baris per BULK request. 0 = pakai default aman.
++	// CATATAN C320/C300: agen SNMP-nya jalan di CPU control-plane yang pas-pasan;
++	// response raksasa (repetitions besar) bikin CPU spike saat merakit PDU.
++	// Jangan asal besar — 20 adalah titik aman (lihat DefaultMaxRepetitions).
++	MaxRepetitions int `json:"maxRepetitions,omitempty"`
+ }
+ 
+ // TelnetConfig holds Telnet credentials
+diff --git a/internal/domain/onu.go b/internal/domain/onu.go
+index 20dfb7f..fb89525 100644
+--- a/internal/domain/onu.go
++++ b/internal/domain/onu.go
+@@ -25,6 +25,7 @@ type ONU struct {
+ }
+ 
+ // ONUListItem is the lightweight response for list endpoints (only populated fields)
++// PATCH(oltwtch): tambah TXPower — endpoint /live butuh realtime tx+rx per ONU.
+ type ONUListItem struct {
+ 	OltID        string  `json:"oltId"`
+ 	Board        int     `json:"board"`
+@@ -35,6 +36,7 @@ type ONUListItem struct {
+ 	Status       string  `json:"status"`
+ 	StatusCode   int     `json:"statusCode"`
+ 	RXPower      float64 `json:"rxPower"`
++	TXPower      float64 `json:"txPower,omitempty"`
+ }
+ 
+ // ONUNameEntry caches static ONU identity (Name + SerialNumber) with long TTL
+@@ -56,6 +58,7 @@ func (o *ONU) ToListItem() ONUListItem {
+ 		Status:       o.Status,
+ 		StatusCode:   o.StatusCode,
+ 		RXPower:      o.RXPower,
++		TXPower:      o.TXPower,
+ 	}
+ }
+ 
+diff --git a/internal/event/alert.go b/internal/event/alert.go
+new file mode 100644
+index 0000000..9c4d406
+--- /dev/null
++++ b/internal/event/alert.go
+@@ -0,0 +1,320 @@
++package event
++
++import (
++	"context"
++	"crypto/rand"
++	"encoding/hex"
++	"encoding/json"
++	"sync"
++	"time"
++
++	"github.com/rs/zerolog/log"
++
++	"olt-monitor/internal/cache"
++)
++
++// Alert: satu notifikasi down yang sudah lolos anti-spam.
++// Disimpan di Redis dan diekspos via GET /api/v1/alerts agar frontend
++// (atau integrasi lain) bisa menampilkannya. Tanpa ketergantungan ke
++// layanan pihak ketiga — backend murni.
++type Alert struct {
++	ID        string    `json:"id"`
++	OLTID     string    `json:"oltId"`
++	Board     int       `json:"board"`
++	Pon       int       `json:"pon"`
++	OnuID     int       `json:"onuId"` // 0 = mass-down satu PON port
++	Kind      string    `json:"kind"`  // "down" | "mass-down"
++	Cause     string    `json:"cause"`
++	Count     int       `json:"count,omitempty"`
++	Severity  string    `json:"severity"` // critical | warning | info
++	Message   string    `json:"message"`
++	CreatedAt time.Time `json:"createdAt"`
++}
++
++// AlertConfig konfigurasi mesin alert.
++type AlertConfig struct {
++	Cooldown      time.Duration // per ONU, default 60m
++	AggWindow     time.Duration // default 90s
++	MassThreshold int           // default 5
++}
++
++// VerifyFunc men-verify ulang apakah sebuah event down masih valid.
++// Dipanggil di momen batch-flush, sebelum alert diterbitkan.
++// Return true = ONU masih down (alert dilanjutkan), false = ONU sudah
++// kembali online (alert dibuang — kemungkinan flapping syslog).
++// Jalur event-driven tetap tidak membebani OLT: verifikasi ini hanya
++// satu SNMP GET terarah per ONU yang akan di-alert, bukan polling.
++// Kesalahan SNMP -> trust syslog (return true).
++type VerifyFunc func(ev Event) bool
++
++// Engine: subscriber bus yang mengubah event down menjadi Alert dengan
++// anti-spam (prinsip: jangan banjiri teknisi):
++//  1. Agregasi: down dikumpulkan AggWindow; satu PON port >= MassThreshold
++//     dalam window -> SATU alert mass-down, bukan N alert.
++//  2. Verifikasi ulang: di momen flush, setiap calon alert di-verify via
++//     SNMP GET status ONU; yang sudah kembali online dibuang (anti false
++//     alarm saat ONU flapping). Aktif bila SetVerifier dipasang.
++//  3. Cooldown: 1 ONU max 1 alert down per Cooldown.
++//  4. Severity: mass-down=critical, los/unknown=warning, power=info
++//     (dying-gasp tetap tercatat, tapi tidak dianggap darurat).
++type Engine struct {
++	cfg   AlertConfig
++	cache *cache.RedisCache
++	in    chan Event
++
++	verify VerifyFunc // nil = tanpa verifikasi ulang (perilaku lama)
++
++	// onEmit dipanggil setiap alert diterbitkan; dipakai unit test
++	// untuk menangkap alert tanpa Redis. Nil di produksi.
++	onEmit func(Alert)
++
++	mu       sync.Mutex
++	buf      map[string][]Event // ponKey -> downs dalam window
++	flushAt  time.Time
++	lastSent map[string]time.Time
++
++	done chan struct{}
++	wg   sync.WaitGroup
++}
++
++// SetVerifier memasang fungsi verifikasi ulang yang dipanggil tepat
++// sebelum alert diterbitkan. Boleh nil untuk menonaktifkan.
++func (e *Engine) SetVerifier(v VerifyFunc) {
++	e.mu.Lock()
++	defer e.mu.Unlock()
++	e.verify = v
++}
++
++func NewEngine(cfg AlertConfig, c *cache.RedisCache) *Engine {
++	if cfg.Cooldown <= 0 {
++		cfg.Cooldown = 60 * time.Minute
++	}
++	if cfg.AggWindow <= 0 {
++		cfg.AggWindow = 90 * time.Second
++	}
++	if cfg.MassThreshold <= 0 {
++		cfg.MassThreshold = 5
++	}
++	return &Engine{
++		cfg:      cfg,
++		cache:    c,
++		in:       make(chan Event, 512),
++		buf:      make(map[string][]Event),
++		lastSent: make(map[string]time.Time),
++		done:     make(chan struct{}),
++	}
++}
++
++// Handle penuhi signature subscriber Bus. Cepat: hanya enqueue.
++func (e *Engine) Handle(ev Event) {
++	if ev.Kind != KindDown {
++		return
++	}
++	select {
++	case e.in <- ev:
++	default:
++		log.Warn().Msg("Alert engine penuh, event dibuang")
++	}
++}
++
++func (e *Engine) Start() {
++	e.wg.Add(1)
++	go e.loop()
++}
++
++func (e *Engine) Stop() {
++	close(e.done)
++	e.wg.Wait()
++}
++
++func (e *Engine) loop() {
++	defer e.wg.Done()
++	tick := time.NewTicker(10 * time.Second)
++	defer tick.Stop()
++	for {
++		select {
++		case <-e.done:
++			e.flushAll()
++			return
++		case ev := <-e.in:
++			e.add(ev)
++		case <-tick.C:
++			e.flushExpired()
++		}
++	}
++}
++
++func (e *Engine) add(ev Event) {
++	key := ev.ponKey()
++	var flushNow bool
++	e.mu.Lock()
++	e.buf[key] = append(e.buf[key], ev)
++	if e.flushAt.IsZero() {
++		e.flushAt = time.Now().Add(e.cfg.AggWindow)
++	}
++	flushNow = len(e.buf[key]) >= e.cfg.MassThreshold
++	e.mu.Unlock()
++	if flushNow {
++		e.flushKey(key)
++	}
++}
++
++func (e *Engine) flushExpired() {
++	e.mu.Lock()
++	if e.flushAt.IsZero() || time.Now().Before(e.flushAt) {
++		e.mu.Unlock()
++		return
++	}
++	keys := make([]string, 0, len(e.buf))
++	for key := range e.buf {
++		keys = append(keys, key)
++	}
++	e.mu.Unlock()
++	for _, key := range keys {
++		e.flushKey(key)
++	}
++	e.mu.Lock()
++	e.flushAt = time.Time{}
++	e.mu.Unlock()
++}
++
++func (e *Engine) flushAll() {
++	e.mu.Lock()
++	keys := make([]string, 0, len(e.buf))
++	for key := range e.buf {
++		keys = append(keys, key)
++	}
++	e.mu.Unlock()
++	for _, key := range keys {
++		e.flushKey(key)
++	}
++}
++
++// flushKey menarik buffer satu PON port, memverifikasi ulang status ONU
++// yang masih down, lalu menerbitkan alert. Verifikasi dilakukan di luar
++// lock (ada I/O jaringan) agar intake event tidak terhambat.
++func (e *Engine) flushKey(key string) {
++	e.mu.Lock()
++	evs := e.buf[key]
++	delete(e.buf, key)
++	e.mu.Unlock()
++
++	if len(evs) == 0 {
++		return
++	}
++	evs = e.reverify(evs)
++	if len(evs) == 0 {
++		log.Debug().Str("pon", key).Msg("Alert dibuang: semua ONU sudah kembali online")
++		return
++	}
++	if len(evs) >= e.cfg.MassThreshold {
++		e0 := evs[0]
++		e.emit(Alert{
++			OLTID:    e0.OLTID,
++			Board:    e0.Board,
++			Pon:      e0.Pon,
++			Kind:     "mass-down",
++			Cause:    CauseMass,
++			Count:    len(evs),
++			Severity: "critical",
++			Message: "MASS DOWN: " + itoa(len(evs)) + " ONU down di " +
++				e0.OLTID + " PON " + itoa(e0.Board) + "/" + itoa(e0.Pon) +
++				". Kemungkinan feeder/splitter/OLT — cek infrastruktur dulu.",
++		})
++		e.mu.Lock()
++		now := time.Now()
++		for _, ev := range evs {
++			e.lastSent[ev.dedupKey()] = now
++		}
++		e.mu.Unlock()
++		return
++	}
++	e.emitSingles(evs)
++}
++
++// reverify membuang event yang ONU-nya sudah kembali online di momen
++// flush. Tanpa verifier (nil), semua event dianggap masih valid.
++func (e *Engine) reverify(evs []Event) []Event {
++	if e == nil || len(evs) == 0 {
++		return evs
++	}
++	verify := e.verify
++	if verify == nil {
++		return evs
++	}
++	kept := evs[:0]
++	for _, ev := range evs {
++		if verify(ev) {
++			kept = append(kept, ev)
++			continue
++		}
++		log.Debug().
++			Str("olt", ev.OLTID).
++			Int("board", ev.Board).Int("pon", ev.Pon).Int("onu", ev.OnuID).
++			Msg("Alert dibuang: ONU kembali online sebelum flush")
++	}
++	return kept
++}
++
++// emitSingles menerbitkan alert per-ONU dengan cooldown.
++func (e *Engine) emitSingles(evs []Event) {
++	e.mu.Lock()
++	defer e.mu.Unlock()
++	now := time.Now()
++	for _, ev := range evs {
++		dk := ev.dedupKey()
++		if last, ok := e.lastSent[dk]; ok && now.Sub(last) < e.cfg.Cooldown {
++			continue // cooldown
++		}
++		e.lastSent[dk] = now
++		severity := "warning"
++		causeMsg := "penyebab belum diketahui"
++		switch ev.Cause {
++		case CausePower:
++			severity = "info"
++			causeMsg = "kemungkinan listrik/adaptor di sisi pelanggan"
++		case CauseLOS:
++			causeMsg = "sinyal optik hilang — cek fiber/konektor"
++		}
++		e.emit(Alert{
++			OLTID:    ev.OLTID,
++			Board:    ev.Board,
++			Pon:      ev.Pon,
++			OnuID:    ev.OnuID,
++			Kind:     "down",
++			Cause:    ev.Cause,
++			Severity: severity,
++			Message: "DOWN: " + ev.OLTID + " " + itoa(ev.Board) + "/" +
++				itoa(ev.Pon) + ":" + itoa(ev.OnuID) + " — " + causeMsg,
++		})
++	}
++}
++
++func (e *Engine) emit(a Alert) {
++	a.ID = newID()
++	a.CreatedAt = time.Now()
++	if e.onEmit != nil {
++		e.onEmit(a)
++	}
++	if e.cache == nil {
++		return
++	}
++	data, err := json.Marshal(a)
++	if err != nil {
++		return
++	}
++	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
++	defer cancel()
++	if err := e.cache.AppendAlert(ctx, data); err != nil {
++		log.Warn().Err(err).Msg("Append alert gagal")
++	}
++	if err := e.cache.PublishAlert(ctx, data); err != nil {
++		log.Warn().Err(err).Msg("Publish alert gagal")
++	}
++}
++
++func newID() string {
++	var b [8]byte
++	_, _ = rand.Read(b[:])
++	return hex.EncodeToString(b[:])
++}
+diff --git a/internal/event/alert_test.go b/internal/event/alert_test.go
+new file mode 100644
+index 0000000..679e5c8
+--- /dev/null
++++ b/internal/event/alert_test.go
+@@ -0,0 +1,118 @@
++package event
++
++import (
++	"testing"
++	"time"
++)
++
++func downEv(olt string, board, pon, onu int, cause string) Event {
++	return Event{
++		OLTID:      olt,
++		Board:      board,
++		Pon:        pon,
++		OnuID:      onu,
++		Kind:       KindDown,
++		Cause:      cause,
++		ReceivedAt: time.Now(),
++	}
++}
++
++func testEngine() (*Engine, *[]Alert) {
++	var got []Alert
++	e := NewEngine(AlertConfig{
++		Cooldown:      60 * time.Minute,
++		AggWindow:     90 * time.Second,
++		MassThreshold: 3,
++	}, nil)
++	e.onEmit = func(a Alert) { got = append(got, a) }
++	return e, &got
++}
++
++// Tanpa verifier: perilaku lama — semua event jadi alert.
++func TestFlushKeyTanpaVerifier(t *testing.T) {
++	e, got := testEngine()
++	e.add(downEv("olt1", 1, 1, 5, CauseLOS))
++	e.add(downEv("olt1", 1, 1, 6, CausePower))
++	e.flushKey("olt1/1/1")
++	if len(*got) != 2 {
++		t.Fatalf("mau 2 alert, dapat %d", len(*got))
++	}
++}
++
++// Verifier bilang onu 5 sudah online -> alert-nya dibuang, onu 6 tetap.
++func TestReverifyBuangYangSudahOnline(t *testing.T) {
++	e, got := testEngine()
++	e.SetVerifier(func(ev Event) bool {
++		return ev.OnuID != 5 // 5 sudah kembali online
++	})
++	e.add(downEv("olt1", 1, 1, 5, CauseLOS))
++	e.add(downEv("olt1", 1, 1, 6, CauseLOS))
++	e.flushKey("olt1/1/1")
++	if len(*got) != 1 {
++		t.Fatalf("mau 1 alert, dapat %d", len(*got))
++	}
++	if (*got)[0].OnuID != 6 {
++		t.Fatalf("mau alert untuk onu 6, dapat onu %d", (*got)[0].OnuID)
++	}
++}
++
++// Semua sudah online -> tidak ada alert sama sekali.
++func TestReverifySemuaOnlineTidakAdaAlert(t *testing.T) {
++	e, got := testEngine()
++	e.SetVerifier(func(ev Event) bool { return false })
++	e.add(downEv("olt1", 1, 1, 5, CauseLOS))
++	e.add(downEv("olt1", 1, 1, 6, CauseLOS))
++	e.flushKey("olt1/1/1")
++	if len(*got) != 0 {
++		t.Fatalf("mau 0 alert, dapat %d", len(*got))
++	}
++}
++
++// Mass-down: sebagian kembali online, sisa di bawah threshold ->
++// jadi alert per-ONU untuk yang masih down (bukan mass-down).
++func TestReverifyMassDownTurunJadiSingles(t *testing.T) {
++	e, got := testEngine() // threshold 3
++	e.SetVerifier(func(ev Event) bool {
++		return ev.OnuID <= 2 // 3 dan 4 sudah online
++	})
++	for i := 1; i <= 4; i++ {
++		e.add(downEv("olt1", 1, 1, i, CauseLOS))
++	}
++	e.flushKey("olt1/1/1")
++	if len(*got) != 2 {
++		t.Fatalf("mau 2 alert single, dapat %d", len(*got))
++	}
++	for _, a := range *got {
++		if a.Kind != "down" {
++			t.Fatalf("mau kind=down, dapat %q", a.Kind)
++		}
++	}
++}
++
++// Mass-down asli: semua masih down -> satu alert mass-down.
++// (early flush saat threshold tercapai; tidak perlu flushKey manual)
++func TestReverifyMassDownAsli(t *testing.T) {
++	e, got := testEngine() // threshold 3
++	e.SetVerifier(func(ev Event) bool { return true })
++	for i := 1; i <= 3; i++ {
++		e.add(downEv("olt1", 1, 1, i, CauseLOS))
++	}
++	if len(*got) != 1 {
++		t.Fatalf("mau 1 alert, dapat %d", len(*got))
++	}
++	if (*got)[0].Kind != "mass-down" || (*got)[0].Count != 3 {
++		t.Fatalf("mau mass-down count=3, dapat %+v", (*got)[0])
++	}
++}
++
++// SetVerifier(nil) menonaktifkan verifikasi -> perilaku lama.
++func TestReverifyNilNonaktif(t *testing.T) {
++	e, got := testEngine()
++	e.SetVerifier(func(ev Event) bool { return false })
++	e.SetVerifier(nil)
++	e.add(downEv("olt1", 1, 1, 5, CauseLOS))
++	e.flushKey("olt1/1/1")
++	if len(*got) != 1 {
++		t.Fatalf("mau 1 alert, dapat %d", len(*got))
++	}
++}
+diff --git a/internal/event/bus.go b/internal/event/bus.go
+new file mode 100644
+index 0000000..2c6d7ec
+--- /dev/null
++++ b/internal/event/bus.go
+@@ -0,0 +1,114 @@
++package event
++
++import (
++	"sync"
++	"time"
++
++	"github.com/rs/zerolog/log"
++)
++
++// dedupWindow: event sama (ONU+jenis) dalam window ini dianggap duplikat.
++// Menangkal: trap ganda dari OLT, duplikat syslog+trap, dan tabrakan dengan poller.
++const dedupWindow = 60 * time.Second
++
++// Bus: fan-out event ke subscriber dengan dedup.
++//
++// Desain: SATU goroutine worker membaca channel buffer. Subscriber dipanggil
++// sekuensial — jadi subscriber WAJIB cepat & non-blocking (tulis Redis OK;
++// kerja berat TIDAK OK di sini — alert engine punya worker+antrean sendiri).
++// Bila buffer penuh, event baru dibuang (lebih baik kehilangan 1 event
++// daripada OOM; poller tetap jadi jaring pengaman via reconcile).
++type Bus struct {
++	in   chan Event
++	subs []func(Event)
++
++	mu   sync.Mutex
++	seen map[string]time.Time
++
++	done chan struct{}
++	wg   sync.WaitGroup
++}
++
++// NewBus buat bus dengan buffer sebesar size.
++func NewBus(size int) *Bus {
++	if size <= 0 {
++		size = 1024
++	}
++	return &Bus{
++		in:   make(chan Event, size),
++		seen: make(map[string]time.Time),
++		done: make(chan struct{}),
++	}
++}
++
++// Subscribe daftarkan penerima event. Panggil sebelum Start.
++func (b *Bus) Subscribe(fn func(Event)) {
++	b.subs = append(b.subs, fn)
++}
++
++// Publish kirim event. Return false bila buffer penuh (event dibuang).
++func (b *Bus) Publish(ev Event) bool {
++	select {
++	case b.in <- ev:
++		return true
++	default:
++		log.Warn().Str("olt", ev.OLTID).Msg("Event bus penuh, event dibuang")
++		return false
++	}
++}
++
++// Start jalankan worker. Stop dengan Close.
++func (b *Bus) Start() {
++	b.wg.Add(1)
++	go b.loop()
++}
++
++// Close hentikan worker.
++func (b *Bus) Close() {
++	close(b.done)
++	b.wg.Wait()
++}
++
++func (b *Bus) loop() {
++	defer b.wg.Done()
++	tidy := time.NewTicker(5 * time.Minute)
++	defer tidy.Stop()
++	for {
++		select {
++		case <-b.done:
++			return
++		case ev := <-b.in:
++			if b.dup(ev) {
++				continue
++			}
++			for _, fn := range b.subs {
++				fn(ev)
++			}
++		case <-tidy.C:
++			b.gc()
++		}
++	}
++}
++
++func (b *Bus) dup(ev Event) bool {
++	key := ev.dedupKey()
++	now := time.Now()
++	b.mu.Lock()
++	defer b.mu.Unlock()
++	if t, ok := b.seen[key]; ok && now.Sub(t) < dedupWindow {
++		return true
++	}
++	b.seen[key] = now
++	return false
++}
++
++func (b *Bus) gc() {
++	cutoff := time.Now().Add(-2 * dedupWindow)
++	b.mu.Lock()
++	for k, t := range b.seen {
++		if t.Before(cutoff) {
++			delete(b.seen, k)
++		}
++	}
++	b.mu.Unlock()
++}
+diff --git a/internal/event/event.go b/internal/event/event.go
+new file mode 100644
+index 0000000..2e023df
+--- /dev/null
++++ b/internal/event/event.go
+@@ -0,0 +1,73 @@
++// Package event: jalur event-driven untuk status ONU.
++//
++// Prinsip #1: JANGAN BEBANI OLT. OLT hanya "didorong" mengirim syslog saat ada
++// kejadian (up/down). Tidak ada polling status di jalur ini — OLT tidak pernah
++// ditanya, hanya didengarkan. Beban CPU/memory OLT praktis nol.
++//
++// Prinsip #2: multi-OLT sejak awal. Setiap event membawa OLTID yang di-resolve
++// dari IP pengirim (lihat mapper.go).
++package event
++
++import "time"
++
++// Kind jenis event.
++type Kind string
++
++const (
++	KindUp   Kind = "up"
++	KindDown Kind = "down"
++)
++
++// Cause penyebab down (diklasifikasikan dari alarm ZTE).
++const (
++	CausePower   = "power"   // dying-gasp: adaptor dicabut / listrik padam
++	CauseLOS     = "los"     // sinyal optik hilang: fiber / konektor
++	CauseMass    = "mass"    // bagian dari mass-down satu PON port
++	CauseUnknown = "unknown"
++)
++
++// Event satu kejadian ONU.
++type Event struct {
++	OLTID      string    `json:"oltId"`
++	Board      int       `json:"board"`
++	Pon        int       `json:"pon"`
++	OnuID      int       `json:"onuId"`
++	Kind       Kind      `json:"kind"`
++	Cause      string    `json:"cause"`
++	Count      int       `json:"count,omitempty"` // untuk cause=mass: jumlah ONU
++	Raw        string    `json:"raw,omitempty"`   // baris syslog asli (dipotong)
++	SourceIP   string    `json:"sourceIp,omitempty"`
++	ReceivedAt time.Time `json:"receivedAt"`
++}
++
++// Key untuk dedup: ONU + jenis event.
++func (e Event) dedupKey() string {
++	return e.OLTID + "/" + itoa(e.Board) + "/" + itoa(e.Pon) + ":" + itoa(e.OnuID) + ":" + string(e.Kind)
++}
++
++// PonKey untuk agregasi mass-down.
++func (e Event) ponKey() string {
++	return e.OLTID + "/" + itoa(e.Board) + "/" + itoa(e.Pon)
++}
++
++func itoa(i int) string {
++	if i == 0 {
++		return "0"
++	}
++	neg := i < 0
++	if neg {
++		i = -i
++	}
++	var b [20]byte
++	p := len(b)
++	for i > 0 {
++		p--
++		b[p] = byte('0' + i%10)
++		i /= 10
++	}
++	if neg {
++		p--
++		b[p] = '-'
++	}
++	return string(b[p:])
++}
+diff --git a/internal/event/mapper.go b/internal/event/mapper.go
+new file mode 100644
+index 0000000..15774fc
+--- /dev/null
++++ b/internal/event/mapper.go
+@@ -0,0 +1,59 @@
++package event
++
++import (
++	"sync"
++
++	"olt-monitor/internal/service"
++)
++
++// Mapper: IP pengirim syslog -> OLTID. Wajib untuk multi-OLT.
++//
++// Urutan resolve:
++//  1. Config eksplisit: event.syslog.sources = { "192.168.1.100": "olt-jkt" }
++//  2. Fallback otomatis: cocokkan dengan host SNMP OLT yang terdaftar
++//     (umumnya syslog dikirim dari IP yang sama dengan IP SNMP OLT).
++type Mapper struct {
++	mu      sync.RWMutex
++	sources map[string]string // ip -> oltID (config)
++
++	manager *service.OLTManager // untuk fallback host SNMP
++}
++
++// NewMapper buat mapper. manager boleh nil (fallback nonaktif).
++func NewMapper(manager *service.OLTManager) *Mapper {
++	return &Mapper{
++		sources: make(map[string]string),
++		manager: manager,
++	}
++}
++
++// SetSources isi/overwrite mapping dari config.
++func (m *Mapper) SetSources(src map[string]string) {
++	m.mu.Lock()
++	defer m.mu.Unlock()
++	for ip, id := range src {
++		m.sources[ip] = id
++	}
++}
++
++// Resolve IP -> OLTID. ok=false bila tidak dikenal.
++func (m *Mapper) Resolve(ip string) (oltID string, ok bool) {
++	if ip == "" {
++		return "", false
++	}
++	m.mu.RLock()
++	id, ok := m.sources[ip]
++	m.mu.RUnlock()
++	if ok {
++		return id, true
++	}
++	// Fallback: samakan dengan host SNMP OLT terdaftar.
++	if m.manager != nil {
++		for _, olt := range m.manager.ListOLTs() {
++			if olt.SNMP.Host == ip {
++				return olt.ID, true
++			}
++		}
++	}
++	return "", false
++}
+diff --git a/internal/event/parser.go b/internal/event/parser.go
+new file mode 100644
+index 0000000..7192e5f
+--- /dev/null
++++ b/internal/event/parser.go
+@@ -0,0 +1,99 @@
++package event
++
++import (
++	"regexp"
++	"strings"
++)
++
++// Pola syslog ZTE. Format teks bisa beda antar firmware — pola yang tidak
++// dikenal dikembalikan sebagai ok=false agar dicatat untuk kalibrasi,
++// bukan di-drop diam-diam.
++var (
++	// gpon-onu_1/2/3:4, gpon_onu 1/2/3:4, onu 1/2/3:4 ...
++	onuRe = regexp.MustCompile(`(?i)gpon[-_ ]?onu[_ ]?(\d+)/(\d+)/(\d+)[:_/](\d+)`)
++
++	causeRes = []struct {
++		cause string
++		re    *regexp.Regexp
++	}{
++		{CausePower, regexp.MustCompile(`(?i)dying[-_ ]?gasp`)},
++		{CauseLOS, regexp.MustCompile(`(?i)\blos\b|link[-_ ]?lost|\blofi\b|\bsdi\b`)},
++	}
++
++	downRes = []*regexp.Regexp{
++		regexp.MustCompile(`(?i)deregister`),
++		regexp.MustCompile(`(?i)\boff ?line\b`),
++		regexp.MustCompile(`(?i)\bdown\b`),
++	}
++	upRes = []*regexp.Regexp{
++		regexp.MustCompile(`(?i)\bon ?line\b`),
++		regexp.MustCompile(`(?i)register.*success|authorized.*success`),
++		regexp.MustCompile(`(?i)los recovery|ranging.*success`),
++		regexp.MustCompile(`(?i)phase.*working`),
++	}
++
++	// Header syslog "<132>Oct  9 14:00:00 hostname ..." — buang agar regex fokus ke isi.
++	headerRe = regexp.MustCompile(`^<\d+>\S*\s*`)
++)
++
++// Parsed hasil parse satu baris syslog.
++type Parsed struct {
++	Board, Pon, OnuID int
++	Kind              Kind
++	Cause             string
++}
++
++// ParseLine parse satu baris syslog ZTE. ok=false bila tidak dikenali.
++func ParseLine(line string) (p Parsed, ok bool) {
++	line = headerRe.ReplaceAllString(line, "")
++	line = strings.TrimSpace(line)
++	if line == "" {
++		return p, false
++	}
++	m := onuRe.FindStringSubmatch(line)
++	if m == nil {
++		return p, false
++	}
++	p.Board = atoi(m[2])
++	p.Pon = atoi(m[3])
++	p.OnuID = atoi(m[4])
++	// m[1] = shelf, jarang dipakai di ZTE C320 (selalu 1)
++
++	p.Cause = CauseUnknown
++	for _, cr := range causeRes {
++		if cr.re.MatchString(line) {
++			p.Cause = cr.cause
++			break
++		}
++	}
++	for _, re := range upRes {
++		if re.MatchString(line) {
++			p.Kind = KindUp
++			p.Cause = ""
++			return p, true
++		}
++	}
++	for _, re := range downRes {
++		if re.MatchString(line) {
++			p.Kind = KindDown
++			return p, true
++		}
++	}
++	// Alarm dying-gasp/LOS secara definisi = down, walau tanpa kata "down".
++	if p.Cause == CausePower || p.Cause == CauseLOS {
++		p.Kind = KindDown
++		return p, true
++	}
++	return p, false
++}
++
++func atoi(s string) int {
++	n := 0
++	for _, c := range s {
++		if c < '0' || c > '9' {
++			break
++		}
++		n = n*10 + int(c-'0')
++	}
++	return n
++}
+diff --git a/internal/event/parser_test.go b/internal/event/parser_test.go
+new file mode 100644
+index 0000000..667020a
+--- /dev/null
++++ b/internal/event/parser_test.go
+@@ -0,0 +1,57 @@
++package event
++
++import "testing"
++
++func TestParseLine(t *testing.T) {
++	cases := []struct {
++		line      string
++		board     int
++		pon       int
++		onu       int
++		kind      Kind
++		cause     string
++	}{
++		{
++			`<134>Oct  9 14:00:01 OLT: gpon-onu_1/2/3:4 dying-gasp alarm`,
++			2, 3, 4, KindDown, CausePower,
++		},
++		{
++			`gpon-onu_1/5/8:16 LOS alarm raised`,
++			5, 8, 16, KindDown, CauseLOS,
++		},
++		{
++			`ONU gpon-onu_1/1/1:1 deregistered`,
++			1, 1, 1, KindDown, CauseUnknown,
++		},
++		{
++			`gpon-onu_1/2/3:4 online`,
++			2, 3, 4, KindUp, "",
++		},
++		{
++			`gpon-onu_1/2/3:4 LOS recovery`,
++			2, 3, 4, KindUp, "",
++		},
++		{
++			`some random log line without onu`,
++			0, 0, 0, "", "",
++		},
++	}
++	for i, c := range cases {
++		p, ok := ParseLine(c.line)
++		if c.kind == "" {
++			if ok {
++				t.Errorf("case %d: expected not-ok, got %+v", i, p)
++			}
++			continue
++		}
++		if !ok {
++			t.Errorf("case %d: expected ok, got not-ok for %q", i, c.line)
++			continue
++		}
++		if p.Board != c.board || p.Pon != c.pon || p.OnuID != c.onu ||
++			p.Kind != c.kind || p.Cause != c.cause {
++			t.Errorf("case %d: got %+v, want board=%d pon=%d onu=%d kind=%s cause=%s",
++				i, p, c.board, c.pon, c.onu, c.kind, c.cause)
++		}
++	}
++}
+diff --git a/internal/event/sink.go b/internal/event/sink.go
+new file mode 100644
+index 0000000..4642663
+--- /dev/null
++++ b/internal/event/sink.go
+@@ -0,0 +1,68 @@
++package event
++
++import (
++	"context"
++	"encoding/json"
++	"time"
++
++	"github.com/rs/zerolog/log"
++
++	"olt-monitor/internal/cache"
++	"olt-monitor/internal/domain"
++)
++
++// Sink: subscriber bus yang menulis event ke Redis.
++//
++// Tiga hal dilakukan per event (semuanya cepat & non-blocking):
++//  1. Patch status ONU di cache list PON (read-modify-write 1 item) —
++//     dashboard yang baca cache langsung lihat status baru tanpa walk SNMP.
++//  2. Publish ke Redis pub/sub "zzte:events" — untuk dashboard realtime (SSE).
++//  3. Append ke event log terbatas (500) — untuk API /events/recent.
++type Sink struct {
++	cache *cache.RedisCache
++}
++
++func NewSink(c *cache.RedisCache) *Sink { return &Sink{cache: c} }
++
++// Handle penuhi signature subscriber Bus.
++func (s *Sink) Handle(ev Event) {
++	if s.cache == nil {
++		return
++	}
++	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
++	defer cancel()
++
++	// 1. patch status di cache list
++	status, code := statusFor(ev)
++	if err := s.cache.PatchONUStatus(ctx, ev.OLTID, ev.Board, ev.Pon, ev.OnuID, status, code); err != nil {
++		log.Debug().Err(err).Msg("Patch status cache gagal (mungkin cache kosong)")
++	}
++	// invalidate detail ONU itu — biar baca berikutnya segar
++	_ = s.cache.InvalidateONUDetail(ctx, ev.OLTID, ev.Board, ev.Pon, ev.OnuID)
++
++	// 2. pub/sub realtime
++	if data, err := json.Marshal(ev); err == nil {
++		if err := s.cache.PublishEvent(ctx, data); err != nil {
++			log.Warn().Err(err).Msg("Publish event gagal")
++		}
++		// 3. event log
++		if err := s.cache.AppendEventLog(ctx, data); err != nil {
++			log.Warn().Err(err).Msg("Append event log gagal")
++		}
++	}
++}
++
++// statusFor samakan kosakata dengan ParseONUStatus (SNMP).
++func statusFor(ev Event) (string, int) {
++	if ev.Kind == KindUp {
++		return "Online", domain.ONUStatusOnline
++	}
++	switch ev.Cause {
++	case CauseLOS:
++		return "LOS", domain.ONUStatusLOS
++	case CausePower:
++		return "DyingGasp", domain.ONUStatusDyingGasp
++	default:
++		return "Offline", domain.ONUStatusOffline
++	}
++}
+diff --git a/internal/event/syslog.go b/internal/event/syslog.go
+new file mode 100644
+index 0000000..df36d4d
+--- /dev/null
++++ b/internal/event/syslog.go
+@@ -0,0 +1,120 @@
++package event
++
++import (
++	"net"
++	"strings"
++	"sync/atomic"
++	"time"
++
++	"github.com/rs/zerolog/log"
++)
++
++// Server menerima syslog via UDP dan meneruskannya ke Bus sebagai Event.
++//
++// Catatan beban OLT: server ini PASIF. OLT yang mengirim saat ada kejadian;
++// tidak ada satu pun paket yang dikirim ke OLT dari jalur ini. Satu-satunya
++// "beban" di OLT adalah 1 baris config: arahkan syslog ke IP:port ini.
++type Server struct {
++	conn   *net.UDPConn
++	bus    *Bus
++	mapper *Mapper
++	port   int
++
++	dropped atomic.Uint64 // datagram dibuang karena antrian penuh
++	unknown atomic.Uint64 // baris tak dikenal (untuk kalibrasi)
++}
++
++// NewServer buat server syslog. bus dan mapper wajib non-nil.
++func NewServer(bus *Bus, mapper *Mapper, port int) *Server {
++	return &Server{bus: bus, mapper: mapper, port: port}
++}
++
++// Serve blokir sampai ctx selesai. Panggil sebagai goroutine.
++func (s *Server) Serve(stop <-chan struct{}) error {
++	addr, err := net.ResolveUDPAddr("udp", "0.0.0.0:"+itoa(s.port))
++	if err != nil {
++		return err
++	}
++	conn, err := net.ListenUDP("udp", addr)
++	if err != nil {
++		return err
++	}
++	s.conn = conn
++	defer conn.Close()
++
++	// Buffer socket besar agar burst trap (mass-down) tidak terbuang di kernel.
++	_ = conn.SetReadBuffer(4 << 20)
++
++	log.Info().Int("port", s.port).Msg("Syslog server dengar (event-driven, nol beban polling)")
++
++	buf := make([]byte, 65535)
++	for {
++		select {
++		case <-stop:
++			return nil
++		default:
++		}
++		_ = conn.SetReadDeadline(time.Now().Add(time.Second))
++		n, src, err := conn.ReadFromUDP(buf)
++		if err != nil {
++			if ne, ok := err.(net.Error); ok && ne.Timeout() {
++				continue
++			}
++			log.Warn().Err(err).Msg("Syslog read error")
++			continue
++		}
++		s.handle(buf[:n], src)
++	}
++}
++
++func (s *Server) handle(data []byte, src *net.UDPAddr) {
++	line := strings.TrimSpace(string(data))
++	if line == "" {
++		return
++	}
++	// Syslog bisa multi-baris; proses per baris.
++	for _, l := range strings.Split(line, "\n") {
++		l = strings.TrimSpace(l)
++		if l == "" {
++			continue
++		}
++		if len(l) > 500 {
++			l = l[:500]
++		}
++		p, ok := ParseLine(l)
++		if !ok {
++			s.unknown.Add(1)
++			log.Debug().Str("line", l).Msg("Syslog tak dikenal (kalibrasi pola?)")
++			continue
++		}
++		srcIP := ""
++		if src != nil {
++			srcIP = src.IP.String()
++		}
++		oltID, ok := s.mapper.Resolve(srcIP)
++		if !ok {
++			log.Warn().Str("src", srcIP).Str("line", l).
++				Msg("Syslog dari IP tak dikenal — daftarkan di event.syslog.sources atau sebagai OLT")
++			continue
++		}
++		ev := Event{
++			OLTID:      oltID,
++			Board:      p.Board,
++			Pon:        p.Pon,
++			OnuID:      p.OnuID,
++			Kind:       p.Kind,
++			Cause:      p.Cause,
++			Raw:        l,
++			SourceIP:   srcIP,
++			ReceivedAt: time.Now(),
++		}
++		if !s.bus.Publish(ev) {
++			s.dropped.Add(1)
++		}
++	}
++}
++
++// Stats untuk endpoint monitoring.
++func (s *Server) Stats() (dropped, unknown uint64) {
++	return s.dropped.Load(), s.unknown.Load()
++}
+diff --git a/internal/handler/event_handler.go b/internal/handler/event_handler.go
+new file mode 100644
+index 0000000..c718056
+--- /dev/null
++++ b/internal/handler/event_handler.go
+@@ -0,0 +1,127 @@
++package handler
++
++import (
++	"encoding/json"
++	"fmt"
++	"net/http"
++	"strconv"
++	"time"
++
++	"github.com/rs/zerolog/log"
++
++	"olt-monitor/internal/cache"
++)
++
++// EventHandler: akses event up/down yang masuk via syslog + alert.
++//
++//  GET /api/v1/events/stream        SSE — dorong event & alert realtime
++//  GET /api/v1/events/recent?limit= event log terakhir (JSON)
++//  GET /api/v1/alerts?limit=        alert down yang lolos anti-spam (JSON)
++type EventHandler struct {
++	cache *cache.RedisCache
++}
++
++func NewEventHandler(c *cache.RedisCache) *EventHandler {
++	return &EventHandler{cache: c}
++}
++
++// Stream: Server-Sent Events. Tanpa dependency websocket — stdlib cukup.
++func (h *EventHandler) Stream(w http.ResponseWriter, r *http.Request) {
++	if h.cache == nil {
++		InternalError(w, "cache tidak tersedia")
++		return
++	}
++	w.Header().Set("Content-Type", "text/event-stream")
++	w.Header().Set("Cache-Control", "no-cache")
++	w.Header().Set("Connection", "keep-alive")
++	w.Header().Set("X-Accel-Buffering", "no")
++	flusher, ok := w.(http.Flusher)
++	if !ok {
++		InternalError(w, "streaming tidak didukung")
++		return
++	}
++
++	ch, closeSub := h.cache.SubscribeEvents(r.Context())
++	defer closeSub()
++	ach, closeAlert := h.cache.SubscribeAlerts(r.Context())
++	defer closeAlert()
++
++	// Kirim status awal agar client tahu stream hidup.
++	fmt.Fprintf(w, "event: hello\ndata: {\"ok\":true}\n\n")
++	flusher.Flush()
++
++	heartbeat := time.NewTicker(25 * time.Second)
++	defer heartbeat.Stop()
++
++	for {
++		select {
++		case <-r.Context().Done():
++			return
++		case msg, ok := <-ch:
++			if !ok {
++				return
++			}
++			fmt.Fprintf(w, "event: onu\ndata: %s\n\n", msg)
++			flusher.Flush()
++		case msg, ok := <-ach:
++			if !ok {
++				return
++			}
++			fmt.Fprintf(w, "event: alert\ndata: %s\n\n", msg)
++			flusher.Flush()
++		case <-heartbeat.C:
++			fmt.Fprintf(w, ": ping\n\n")
++			flusher.Flush()
++		}
++	}
++}
++
++// Alerts: alert down yang lolos anti-spam. Untuk ditampilkan frontend.
++func (h *EventHandler) Alerts(w http.ResponseWriter, r *http.Request) {
++	if h.cache == nil {
++		InternalError(w, "cache tidak tersedia")
++		return
++	}
++	limit := 50
++	if q := r.URL.Query().Get("limit"); q != "" {
++		if n, err := strconv.Atoi(q); err == nil && n > 0 {
++			limit = n
++		}
++	}
++	raw, err := h.cache.RecentAlerts(r.Context(), limit)
++	if err != nil {
++		log.Error().Err(err).Msg("Gagal baca alert log")
++		InternalError(w, "gagal baca alert")
++		return
++	}
++	out := make([]json.RawMessage, 0, len(raw))
++	for _, b := range raw {
++		out = append(out, json.RawMessage(b))
++	}
++	Success(w, out)
++}
++
++// Recent: event log terakhir.
++func (h *EventHandler) Recent(w http.ResponseWriter, r *http.Request) {
++	if h.cache == nil {
++		InternalError(w, "cache tidak tersedia")
++		return
++	}
++	limit := 50
++	if q := r.URL.Query().Get("limit"); q != "" {
++		if n, err := strconv.Atoi(q); err == nil && n > 0 {
++			limit = n
++		}
++	}
++	raw, err := h.cache.RecentEvents(r.Context(), limit)
++	if err != nil {
++		log.Error().Err(err).Msg("Gagal baca event log")
++		InternalError(w, "gagal baca event log")
++		return
++	}
++	out := make([]json.RawMessage, 0, len(raw))
++	for _, b := range raw {
++		out = append(out, json.RawMessage(b))
++	}
++	Success(w, out)
++}
+diff --git a/internal/handler/onu_handler.go b/internal/handler/onu_handler.go
+index 0fba0b6..5dcd22a 100644
+--- a/internal/handler/onu_handler.go
++++ b/internal/handler/onu_handler.go
+@@ -140,6 +140,55 @@ func (h *ONUHandler) GetONUDetail(w http.ResponseWriter, r *http.Request) {
+ 	Success(w, onu)
+ }
+ 
++// GetONULive returns FRESH status + rx/tx for a whole PON port, fast.
++// PATCH(oltwtch): GET /api/v1/olt/{oltId}/board/{board}/pon/{pon}/live
++// "Mode benerin": teknisi butuh tahu detik ini juga apakah ONU sudah up dan
++// redamannya berapa — tanpa menunggu cache, tanpa antre di belakang user lain.
++func (h *ONUHandler) GetONULive(w http.ResponseWriter, r *http.Request) {
++	oltID := chi.URLParam(r, "oltId")
++	boardStr := chi.URLParam(r, "board")
++	ponStr := chi.URLParam(r, "pon")
++
++	if oltID == "" {
++		BadRequest(w, "OLT ID is required")
++		return
++	}
++	board, err := strconv.Atoi(boardStr)
++	if err != nil || board < 1 {
++		BadRequest(w, "Invalid board number")
++		return
++	}
++	pon, err := strconv.Atoi(ponStr)
++	if err != nil || pon < 1 {
++		BadRequest(w, "Invalid PON number")
++		return
++	}
++
++	log.Debug().Str("oltId", oltID).Int("board", board).Int("pon", pon).Msg("Live refresh PON")
++
++	// Timeout lebih pendek dari list biasa: live path memang dirancang cepat.
++	// Kalau sampai timeout, berarti OLT sedang berat — jangan dipaksa.
++	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
++	defer cancel()
++
++	onus, err := h.onuService.GetONULive(ctx, oltID, board, pon)
++	if err != nil {
++		if errors.Is(err, context.DeadlineExceeded) {
++			Error(w, http.StatusGatewayTimeout, "OLT sibuk, coba lagi beberapa detik")
++			return
++		}
++		if errors.Is(err, domain.ErrOLTNotFound) {
++			NotFound(w, "OLT not found")
++			return
++		}
++		log.Error().Err(err).Msg("Failed live refresh")
++		InternalError(w, "Live refresh gagal: "+err.Error())
++		return
++	}
++
++	Success(w, onus)
++}
++
+ // GetPONList returns list of PONs with descriptions
+ // GET /api/v1/olt/{oltId}/board/{board}/pon
+ func (h *ONUHandler) GetPONList(w http.ResponseWriter, r *http.Request) {
+diff --git a/internal/handler/router.go b/internal/handler/router.go
+index 8438df8..d61d552 100644
+--- a/internal/handler/router.go
++++ b/internal/handler/router.go
+@@ -15,7 +15,7 @@ import (
+ )
+ 
+ // NewRouter creates and configures the Chi router
+-func NewRouter(oltHandler *OLTHandler, onuHandler *ONUHandler, authHandler *AuthHandler, userHandler *UserHandler, systemHandler *SystemHandler, searchHandler *SearchHandler, controlHandler *ControlHandler, provisioningHandler *ProvisioningHandler, activityHandler *ActivityHandler) *chi.Mux {
++func NewRouter(oltHandler *OLTHandler, onuHandler *ONUHandler, authHandler *AuthHandler, userHandler *UserHandler, systemHandler *SystemHandler, searchHandler *SearchHandler, controlHandler *ControlHandler, provisioningHandler *ProvisioningHandler, activityHandler *ActivityHandler, eventHandler *EventHandler) *chi.Mux {
+ 	r := chi.NewRouter()
+ 
+ 	// Middleware
+@@ -57,6 +57,8 @@ func NewRouter(oltHandler *OLTHandler, onuHandler *ONUHandler, authHandler *Auth
+ 
+ 				// ONU routes
+ 				r.Get("/olt/{oltId}/board/{board}/pon/{pon}", onuHandler.GetONUList)
++				// PATCH(oltwtch): jalur cepat troubleshooting — status + rx/tx segar per PON
++				r.Get("/olt/{oltId}/board/{board}/pon/{pon}/live", onuHandler.GetONULive)
+ 				r.Get("/olt/{oltId}/board/{board}/pon/{pon}/onu/{onuId}", onuHandler.GetONUDetail)
+ 				r.Get("/olt/{oltId}/board/{board}/pon", onuHandler.GetPONList)
+ 
+@@ -70,6 +72,12 @@ func NewRouter(oltHandler *OLTHandler, onuHandler *ONUHandler, authHandler *Auth
+ 				// Search routes (read)
+ 				r.Get("/search", searchHandler.Search)
+ 				r.Get("/search/stats", searchHandler.GetStats)
++
++				// PATCH(oltwtch-event): event up/down via syslog (SSE realtime + log)
++				r.Get("/events/stream", eventHandler.Stream)
++				r.Get("/events/recent", eventHandler.Recent)
++				// PATCH(oltwtch-alert): alert down anti-spam untuk frontend
++				r.Get("/alerts", eventHandler.Alerts)
+ 			})
+ 
+ 			r.Group(func(r chi.Router) {
+@@ -145,7 +153,10 @@ func SetupRoutes(cfg *config.Config, manager *service.OLTManager, onuService *se
+ 	provisioningService := service.NewProvisioningService(manager, telnetService)
+ 	provisioningHandler := NewProvisioningHandler(provisioningService, manager, activityService)
+ 
+-	r := NewRouter(oltHandler, onuHandler, authHandler, userHandler, systemHandler, searchHandler, controlHandler, provisioningHandler, activityHandler)
++	// PATCH(oltwtch-event): handler event up/down (SSE + recent)
++	eventHandler := NewEventHandler(cache)
++
++	r := NewRouter(oltHandler, onuHandler, authHandler, userHandler, systemHandler, searchHandler, controlHandler, provisioningHandler, activityHandler, eventHandler)
+ 
+ 	return r
+ }
+diff --git a/internal/poller/optical.go b/internal/poller/optical.go
+index 911efb3..87bb95a 100644
+--- a/internal/poller/optical.go
++++ b/internal/poller/optical.go
+@@ -8,6 +8,7 @@ import (
+ 	"strconv"
+ 	"strings"
+ 	"sync"
++	"sync/atomic"
+ 	"time"
+ 
+ 	"github.com/rs/zerolog/log"
+@@ -25,17 +26,41 @@ type OpticalPoller struct {
+ 	cfg     *config.Config
+ 	cancel  context.CancelFunc
+ 	done    chan struct{}
++	hot     *service.HotTracker // PATCH(oltwtch-2): prioritas port panas (opsional)
++
++	// PATCH(oltwtch): cache daftar PON (guard anti-tumpuk ada di closure per-OLT
++	// di Start, karena satu siklus 32 PON bisa lebih lama dari interval ticker).
++	ponsMu   sync.RWMutex
++	pons     map[string][]ponPort // oltID -> daftar PON (di-discover sekali saja)
++	ponsTime map[string]time.Time
++
++	cyclesMu sync.Mutex
++	cycles   map[string]int // oltID -> jumlah siklus (untuk tier dingin)
+ }
+ 
+-func NewOpticalPoller(manager *service.OLTManager, cache *cache.RedisCache, cfg *config.Config) *OpticalPoller {
+-	return &OpticalPoller{
+-		manager: manager,
+-		cache:   cache,
+-		cfg:     cfg,
+-		done:    make(chan struct{}),
++// NewOpticalPoller — parameter hotTracker opsional (variadic) agar kode lama kompil.
++func NewOpticalPoller(manager *service.OLTManager, cache *cache.RedisCache, cfg *config.Config, hot ...*service.HotTracker) *OpticalPoller {
++	p := &OpticalPoller{
++		manager:  manager,
++		cache:    cache,
++		cfg:      cfg,
++		done:     make(chan struct{}),
++		pons:     make(map[string][]ponPort),
++		ponsTime: make(map[string]time.Time),
++		cycles:   make(map[string]int),
+ 	}
++	if len(hot) > 0 {
++		p.hot = hot[0]
++	}
++	return p
+ }
+ 
++// hotWindow: port dianggap panas bila dibuka user dalam 15 menit terakhir.
++const hotWindow = 15 * time.Minute
++
++// coldEvery: port dingin dipoll tiap N siklus (hemat beban OLT).
++const coldEvery = 6
++
+ func (p *OpticalPoller) Start(parentCtx context.Context) {
+ 	ctx, cancel := context.WithCancel(parentCtx)
+ 	p.cancel = cancel
+@@ -69,6 +94,16 @@ func (p *OpticalPoller) Start(parentCtx context.Context) {
+ 				defer wg.Done()
+ 				log.Info().Str("oltId", oltID).Dur("interval", ivl).Msg("Optical poller dimulai untuk OLT")
+ 
++				// PATCH(oltwtch): guard per-OLT — jangan mulai siklus baru kalau
++				// yang lama belum selesai. Ini yang bikin OLT "dikeroyok" poller.
++				var polling atomic.Bool
++
++				// PATCH(oltwtch-2): circuit breaker — kalau OLT error/berat
++				// berturut-turut, mundurkan jadwal (exponential backoff, maks 1 jam)
++				// agar OLT sempat pulih, bukan makin ditimpa.
++				var consecutiveErrors int
++				var skipUntil time.Time
++
+ 				if err := p.pollOLT(ctx, oltID); err != nil && ctx.Err() == nil {
+ 					log.Error().Err(err).Str("oltId", oltID).Msg("Poll pertama gagal")
+ 				}
+@@ -81,8 +116,36 @@ func (p *OpticalPoller) Start(parentCtx context.Context) {
+ 					case <-ctx.Done():
+ 						return
+ 					case <-ticker.C:
+-						if err := p.pollOLT(ctx, oltID); err != nil && ctx.Err() == nil {
++						if time.Now().Before(skipUntil) {
++							log.Warn().Str("oltId", oltID).
++								Msg("Circuit breaker: OLT sedang bermasalah, siklus dilewati")
++							continue
++						}
++						if !polling.CompareAndSwap(false, true) {
++							log.Warn().Str("oltId", oltID).
++								Msg("Siklus poll sebelumnya belum selesai, lewati")
++							continue
++						}
++						cycleStart := time.Now()
++						err := p.pollOLT(ctx, oltID)
++						polling.Store(false)
++						if err != nil && ctx.Err() == nil {
+ 							log.Error().Err(err).Str("oltId", oltID).Msg("Poll gagal")
++							consecutiveErrors++
++							backoff := ivl
++							for i := 0; i < consecutiveErrors && backoff < time.Hour; i++ {
++								backoff *= 2
++							}
++							skipUntil = time.Now().Add(backoff)
++							log.Warn().Str("oltId", oltID).Dur("backoff", backoff).
++								Int("gagal_berturut", consecutiveErrors).
++								Msg("Polling dijeda sementara")
++						} else {
++							consecutiveErrors = 0
++							if d := time.Since(cycleStart); d > ivl {
++								log.Warn().Str("oltId", oltID).Dur("durasi", d).Dur("interval", ivl).
++									Msg("Siklus lebih lama dari interval — pertimbangkan interval lebih besar")
++							}
+ 						}
+ 					}
+ 				}
+@@ -151,7 +214,9 @@ func (p *OpticalPoller) pollOLT(ctx context.Context, oltID string) error {
+ 
+ 	log.Debug().Str("oltId", oltID).Msg("Mulai polling OLT")
+ 
+-	pons, err := p.discoverPONs(client)
++	// PATCH(oltwtch): daftar PON hampir tidak pernah berubah — discover sekali
++	// saja per 24 jam, jangan walk ulang tiap siklus.
++	pons, err := p.getPONs(ctx, oltID, client)
+ 	if err != nil {
+ 		return fmt.Errorf("gagal discover PON untuk OLT %s: %w", oltID, err)
+ 	}
+@@ -161,6 +226,36 @@ func (p *OpticalPoller) pollOLT(ctx context.Context, oltID string) error {
+ 		return nil
+ 	}
+ 
++	// PATCH(oltwtch-2): tiered polling. Port panas (baru dibuka user) dipoll
++	// tiap siklus; port dingin cukup tiap coldEvery siklus. Tanpa tracker,
++	// semua dianggap panas (perilaku lama).
++	// PATCH(oltwtch-3): STAGGER. Port dingin tidak lagi diborong tiap
++	// coldEvery siklus (ledakan beban 6x -> memicu degraded mode di port
++	// padat, terbukti via simulasi). Tiap port dingin dapat slot rotasi
++	// deterministik (board/pon % coldEvery) sehingga beban rata tiap siklus.
++	// Tiap port dingin tetap dikunjungi tiap coldEvery siklus.
++	p.cyclesMu.Lock()
++	p.cycles[oltID]++
++	cycle := p.cycles[oltID]
++	p.cyclesMu.Unlock()
++
++	active := make([]ponPort, 0, len(pons))
++	for _, pp := range pons {
++		if p.hot.IsHot(oltID, pp.board, pp.pon, hotWindow) {
++			active = append(active, pp)
++			continue
++		}
++		slot := (pp.board*32 + pp.pon) % coldEvery
++		if cycle%coldEvery == slot {
++			active = append(active, pp)
++		}
++	}
++	if len(active) == 0 {
++		log.Debug().Str("oltId", oltID).Msg("Tidak ada PON panas/dingin jatuh tempo, lewati")
++		return nil
++	}
++	pons = active
++
+ 	// Simpan daftar PON ke cache per board (TTL 24 jam, jarang berubah)
+ 	if p.cache != nil {
+ 		boardPons := make(map[int][]domain.PONInfo)
+@@ -230,7 +325,37 @@ func (p *OpticalPoller) pollOLT(ctx context.Context, oltID string) error {
+ 	return nil
+ }
+ 
++// getPONs mengembalikan daftar PON; discover via SNMP hanya bila cache kosong
++// atau lebih tua dari 24 jam.
++func (p *OpticalPoller) getPONs(ctx context.Context, oltID string, client *snmp.Client) ([]ponPort, error) {
++	p.ponsMu.RLock()
++	pons, ok := p.pons[oltID]
++	ts := p.ponsTime[oltID]
++	p.ponsMu.RUnlock()
++	if ok && len(pons) > 0 && time.Since(ts) < 24*time.Hour {
++		return pons, nil
++	}
++
++	pons, err := p.discoverPONs(client)
++	if err != nil {
++		return nil, err
++	}
++	p.ponsMu.Lock()
++	p.pons[oltID] = pons
++	p.ponsTime[oltID] = time.Now()
++	p.ponsMu.Unlock()
++	return pons, nil
++}
++
+ func (p *OpticalPoller) pollPON(ctx context.Context, client *snmp.Client, adapter snmp.FirmwareAdapter, oltID string, board, pon, ifIndex int, ttl time.Duration) (int, error) {
++	// PATCH(oltwtch): poller menghormati lock per-PON yang sama dengan request
++	// on-demand — tidak ada lagi walk ganda ke PON yang sama dari dua jalur.
++	release, err := p.manager.AcquirePONLock(ctx, oltID, board, pon)
++	if err != nil {
++		return 0, fmt.Errorf("gagal lock PON %d/%d: %w", board, pon, err)
++	}
++	defer release()
++
+ 	statusOID := snmp.BuildWalkOID(snmp.OIDONUStatus, ifIndex)
+ 	statusResults, err := client.BulkWalk(statusOID)
+ 	if err != nil {
+diff --git a/internal/service/hot_tracker.go b/internal/service/hot_tracker.go
+new file mode 100644
+index 0000000..cb33168
+--- /dev/null
++++ b/internal/service/hot_tracker.go
+@@ -0,0 +1,50 @@
++package service
++
++import (
++	"fmt"
++	"sync"
++	"time"
++)
++
++// HotTracker mencatat PON port mana yang sedang aktif dibuka user.
++//
++// Ini jawaban atas "polling terus atau on-demand?": keduanya —
++//   - background poller TETAP jalan (wajib untuk history/tren redaman),
++//     tapi port "panas" (baru dibuka user) dipoll tiap siklus,
++//     port dingin cukup sesekali;
++//   - data real-time saat troubleshooting diambil via endpoint /live (on-demand).
++type HotTracker struct {
++	mu   sync.RWMutex
++	last map[string]time.Time
++}
++
++func NewHotTracker() *HotTracker {
++	return &HotTracker{last: make(map[string]time.Time)}
++}
++
++func hotKey(oltID string, board, pon int) string {
++	return fmt.Sprintf("%s/%d/%d", oltID, board, pon)
++}
++
++// Touch dipanggil setiap user membuka data suatu PON port. Aman dipanggil
++// dengan receiver nil (jadi no-op) agar tracker bersifat opsional.
++func (h *HotTracker) Touch(oltID string, board, pon int) {
++	if h == nil {
++		return
++	}
++	h.mu.Lock()
++	h.last[hotKey(oltID, board, pon)] = time.Now()
++	h.mu.Unlock()
++}
++
++// IsHot true bila port disentuh dalam window terakhir.
++// Tanpa tracker (nil): anggap semua panas = perilaku lama.
++func (h *HotTracker) IsHot(oltID string, board, pon int, window time.Duration) bool {
++	if h == nil {
++		return true
++	}
++	h.mu.RLock()
++	t, ok := h.last[hotKey(oltID, board, pon)]
++	h.mu.RUnlock()
++	return ok && time.Since(t) < window
++}
+diff --git a/internal/service/olt_manager.go b/internal/service/olt_manager.go
+index e5f116d..7e05c5e 100644
+--- a/internal/service/olt_manager.go
++++ b/internal/service/olt_manager.go
+@@ -131,12 +131,25 @@ func (m *OLTManager) UnregisterOLT(ctx context.Context, oltID string) error {
+ }
+ 
+ // AcquireSNMPLock serializes SNMP operations per OLT to avoid contention
++// (dipakai untuk operasi level OLT: system info, indexer).
+ func (m *OLTManager) AcquireSNMPLock(ctx context.Context, oltID string) (func(), error) {
++	return m.acquireLock(ctx, "olt:"+oltID)
++}
++
++// PATCH(oltwtch): AcquirePONLock — lock per PON port, bukan per OLT.
++// User di PON 1/2/3 tidak lagi diblokir user di PON 1/2/4. Satu PON port
++// tetap serial (melindungi OLT dari walk ganda ke port yang sama),
++// tapi port yang berbeda jalan paralel.
++func (m *OLTManager) AcquirePONLock(ctx context.Context, oltID string, board, pon int) (func(), error) {
++	return m.acquireLock(ctx, fmt.Sprintf("pon:%s/%d/%d", oltID, board, pon))
++}
++
++func (m *OLTManager) acquireLock(ctx context.Context, key string) (func(), error) {
+ 	m.mu.Lock()
+-	lock, ok := m.opLocks[oltID]
++	lock, ok := m.opLocks[key]
+ 	if !ok {
+ 		lock = make(chan struct{}, 1)
+-		m.opLocks[oltID] = lock
++		m.opLocks[key] = lock
+ 	}
+ 	m.mu.Unlock()
+ 
+diff --git a/internal/service/onu_service.go b/internal/service/onu_service.go
+index f20fd8f..8162649 100644
+--- a/internal/service/onu_service.go
++++ b/internal/service/onu_service.go
+@@ -23,21 +23,30 @@ import (
+ type ONUService struct {
+ 	manager *OLTManager
+ 	cache   *cache.RedisCache
+-	sfGroup singleflight.Group // deduplikasi request SNMP per OLT+board+pon
++	sfGroup  singleflight.Group // deduplikasi list per OLT+board+pon
++	sfDetail singleflight.Group // PATCH(oltwtch): dedup detail per OLT+board+pon+onu
++	sfLive   singleflight.Group // PATCH(oltwtch): dedup live per OLT+board+pon
++	hot      *HotTracker        // PATCH(oltwtch-2): tracker port panas (opsional)
+ }
+ 
+-// NewONUService creates a new ONU service
+-func NewONUService(manager *OLTManager, cache *cache.RedisCache) *ONUService {
+-	return &ONUService{
++// NewONUService creates a new ONU service.
++// Parameter hotTracker opsional (variadic) agar kode lama tetap kompil.
++func NewONUService(manager *OLTManager, cache *cache.RedisCache, hot ...*HotTracker) *ONUService {
++	s := &ONUService{
+ 		manager: manager,
+ 		cache:   cache,
+ 	}
++	if len(hot) > 0 {
++		s.hot = hot[0]
++	}
++	return s
+ }
+ 
+ // GetONUList retrieves list of ONUs on a specific PON port
+ // Returns minimal data (ID, Name, Status) for fast response
+ // Use GetONUDetail for complete ONU information
+ func (s *ONUService) GetONUList(ctx context.Context, oltID string, board, pon int, forceFresh bool) ([]domain.ONUListItem, error) {
++	s.hot.Touch(oltID, board, pon) // PATCH(oltwtch-2): tandai port panas
+ 	// Check cache first (unless forced)
+ 	if s.cache != nil && !forceFresh {
+ 		cacheData, err := s.cache.GetONUList(ctx, oltID, board, pon)
+@@ -97,7 +106,8 @@ func (s *ONUService) GetONUList(ctx context.Context, oltID string, board, pon in
+ 			return nil, err
+ 		}
+ 
+-		release, err := s.manager.AcquireSNMPLock(ctx, oltID)
++		// PATCH(oltwtch): lock per-PON, bukan per-OLT
++		release, err := s.manager.AcquirePONLock(ctx, oltID, board, pon)
+ 		if err != nil {
+ 			return nil, err
+ 		}
+@@ -157,27 +167,7 @@ func (s *ONUService) GetONUList(ctx context.Context, oltID string, board, pon in
+ 
+ 		// NOTE: Offline reason is intentionally not walked for list to keep it fast.
+ 
+-		// 2. Walk Names
+-		nameOID := snmp.BuildWalkOID(snmp.OIDONUName, ifIndex)
+-		if results, err := client.BulkWalk(nameOID); err == nil {
+-			for _, pdu := range results {
+-				if id, err := extractONUID(pdu.Name, nameOID); err == nil {
+-					getONU(id).Name = strings.TrimSpace(snmp.PduToString(&pdu))
+-				}
+-			}
+-		}
+-
+-		// 3. Walk Serial Numbers
+-		snOID := snmp.BuildWalkOID(snmp.OIDONUSerialNumber, ifIndex)
+-		if results, err := client.BulkWalk(snOID); err == nil {
+-			for _, pdu := range results {
+-				if id, err := extractONUID(pdu.Name, snOID); err == nil {
+-					getONU(id).SerialNumber = snmp.ParseSerialNumber(&pdu)
+-				}
+-			}
+-		}
+-
+-		// 4. Walk RX Power
++		// 2. Walk RX Power (didahulukan — ini yang dibutuhkan real-time)
+ 		adapter, _ := s.manager.GetAdapter(oltID)
+ 		rxOID := snmp.BuildWalkOID(snmp.OIDONURXPower, ifIndex)
+ 		if results, err := client.BulkWalk(rxOID); err == nil {
+@@ -193,6 +183,53 @@ func (s *ONUService) GetONUList(ctx context.Context, oltID string, board, pon in
+ 			}
+ 		}
+ 
++		// 3. Nama/Serial: coba dari names cache dulu (TTL 10 jam, diisi names
++		//    poller). Walk SNMP hanya untuk ONU yang namanya masih kosong.
++		//    PATCH(oltwtch-2): menghemat 2 walk di kasus umum.
++		needNames := false
++		if s.cache != nil {
++			if namesData, nErr := s.cache.GetONUNames(ctx, oltID, board, pon); nErr == nil {
++				var names []domain.ONUNameEntry
++				if json.Unmarshal(namesData, &names) == nil {
++					namesMap := make(map[int]domain.ONUNameEntry, len(names))
++					for _, n := range names {
++						namesMap[n.OnuID] = n
++					}
++					for id, onu := range onuMap {
++						if n, ok := namesMap[id]; ok {
++							onu.Name = n.Name
++							onu.SerialNumber = n.SerialNumber
++						}
++					}
++				}
++			}
++		}
++		for _, onu := range onuMap {
++			if onu.Name == "" {
++				needNames = true
++				break
++			}
++		}
++		if needNames {
++			nameOID := snmp.BuildWalkOID(snmp.OIDONUName, ifIndex)
++			if results, err := client.BulkWalk(nameOID); err == nil {
++				for _, pdu := range results {
++					if id, err := extractONUID(pdu.Name, nameOID); err == nil {
++						getONU(id).Name = strings.TrimSpace(snmp.PduToString(&pdu))
++					}
++				}
++			}
++
++			snOID := snmp.BuildWalkOID(snmp.OIDONUSerialNumber, ifIndex)
++			if results, err := client.BulkWalk(snOID); err == nil {
++				for _, pdu := range results {
++					if id, err := extractONUID(pdu.Name, snOID); err == nil {
++						getONU(id).SerialNumber = snmp.ParseSerialNumber(&pdu)
++					}
++				}
++			}
++		}
++
+ 		// Convert map to sorted slice
+ 		onus := make([]domain.ONU, 0, len(onuMap))
+ 		for _, onu := range onuMap {
+@@ -288,6 +325,7 @@ func extractONUID(fullOID, baseOID string) (int, error) {
+ 
+ // GetONUDetail retrieves complete info for a single ONU
+ func (s *ONUService) GetONUDetail(ctx context.Context, oltID string, board, pon, onuID int, forceFresh bool) (*domain.ONU, error) {
++	s.hot.Touch(oltID, board, pon) // PATCH(oltwtch-2): tandai port panas
+ 	// Check cache first (unless forced)
+ 	if s.cache != nil && !forceFresh {
+ 		cacheData, err := s.cache.GetONUDetail(ctx, oltID, board, pon, onuID)
+@@ -301,23 +339,28 @@ func (s *ONUService) GetONUDetail(ctx context.Context, oltID string, board, pon,
+ 		}
+ 	}
+ 
+-	client, err := s.manager.GetClient(oltID)
+-	if err != nil {
+-		return nil, err
+-	}
++	// PATCH(oltwtch): deduplikasi via singleflight — 4 user klik ONU yang sama
++	// dalam waktu bersamaan = 1 batch SNMP, hasilnya dibagi ke semua.
++	sfKey := fmt.Sprintf("detail:%s:%d:%d:%d", oltID, board, pon, onuID)
++	v, err, _ := s.sfDetail.Do(sfKey, func() (interface{}, error) {
++		client, err := s.manager.GetClient(oltID)
++		if err != nil {
++			return nil, err
++		}
+ 
+-	release, err := s.manager.AcquireSNMPLock(ctx, oltID)
+-	if err != nil {
+-		return nil, err
+-	}
+-	defer release()
++		// PATCH(oltwtch): lock per-PON, bukan per-OLT
++		release, err := s.manager.AcquirePONLock(ctx, oltID, board, pon)
++		if err != nil {
++			return nil, err
++		}
++		defer release()
+ 
+-	start := time.Now()
++		start := time.Now()
+ 
+-	adapter, _ := s.manager.GetAdapter(oltID)
+-	ifIndex := snmp.CalculateIfIndex(1, board, pon)
++		adapter, _ := s.manager.GetAdapter(oltID)
++		ifIndex := snmp.CalculateIfIndex(1, board, pon)
+ 
+-	// Batch GET — 1 SNMP round-trip вместо 10 sequential request
++		// Batch GET — 1 SNMP round-trip untuk 10 OID
+ 	oidName := snmp.BuildONUOID(snmp.OIDONUName, ifIndex, onuID, "")
+ 	oidSN := snmp.BuildONUOID(snmp.OIDONUSerialNumber, ifIndex, onuID, "")
+ 	oidType := snmp.BuildONUOID(snmp.OIDONUType, ifIndex, onuID, "")
+@@ -398,14 +441,139 @@ func (s *ONUService) GetONUDetail(ctx context.Context, oltID string, board, pon,
+ 
+ 	onu.WanIp = getString(oidWanIp)
+ 
+-	if s.cache != nil {
+-		if data, err := json.Marshal(onu); err == nil {
+-			ttl := adaptiveTTL(cache.TTLONUDetail, time.Since(start))
+-			s.cache.SetONUDetailWithTTL(ctx, oltID, board, pon, onuID, data, ttl)
++		if s.cache != nil {
++			if data, err := json.Marshal(onu); err == nil {
++				ttl := adaptiveTTL(cache.TTLONUDetail, time.Since(start))
++				s.cache.SetONUDetailWithTTL(ctx, oltID, board, pon, onuID, data, ttl)
++			}
+ 		}
++
++		return onu, nil
++	})
++	if err != nil {
++		return nil, err
+ 	}
++	return v.(*domain.ONU), nil
++}
+ 
+-	return onu, nil
++// GetONULive — PATCH(oltwtch): jalur cepat khusus troubleshooting ("mode benerin").
++// Hanya walk 3 tabel: status + rx + tx. Nama/serial diambil dari cache (tidak berubah
++// saat teknisi lagi perbaiki). Dengan MaxRepetitions=50, satu PON port selesai dalam
++// ~2-4 detik, bukan belasan detik. Hasilnya juga ditulis ke cache list agar semua
++// user langsung melihat data segar.
++func (s *ONUService) GetONULive(ctx context.Context, oltID string, board, pon int) ([]domain.ONUListItem, error) {
++	s.hot.Touch(oltID, board, pon) // PATCH(oltwtch-2): tandai port panas
++	sfKey := fmt.Sprintf("live:%s:%d:%d", oltID, board, pon)
++	v, err, _ := s.sfLive.Do(sfKey, func() (interface{}, error) {
++		client, err := s.manager.GetClient(oltID)
++		if err != nil {
++			return nil, err
++		}
++
++		release, err := s.manager.AcquirePONLock(ctx, oltID, board, pon)
++		if err != nil {
++			return nil, err
++		}
++		defer release()
++
++		start := time.Now()
++		adapter, _ := s.manager.GetAdapter(oltID)
++		ifIndex := snmp.CalculateIfIndex(1, board, pon)
++
++		onuMap := make(map[int]*domain.ONUListItem)
++		getItem := func(id int) *domain.ONUListItem {
++			if _, ok := onuMap[id]; !ok {
++				onuMap[id] = &domain.ONUListItem{OltID: oltID, Board: board, Pon: pon, OnuID: id}
++			}
++			return onuMap[id]
++		}
++		convertPower := func(raw int) float64 {
++			if adapter != nil {
++				return adapter.ConvertPower(raw)
++			}
++			return float64(raw-10000) / 100.0
++		}
++
++		// 1. status (sekaligus discovery ONU)
++		statusOID := snmp.BuildWalkOID(snmp.OIDONUStatus, ifIndex)
++		statusResults, err := client.BulkWalk(statusOID)
++		if err != nil {
++			return nil, fmt.Errorf("walk status gagal: %w", err)
++		}
++		for _, pdu := range statusResults {
++			if id, err := extractONUID(pdu.Name, statusOID); err == nil {
++				it := getItem(id)
++				it.Status = snmp.ParseONUStatus(&pdu)
++				it.StatusCode = snmp.ParseStatusToInt(&pdu)
++			}
++		}
++		if len(onuMap) == 0 {
++			return []domain.ONUListItem{}, nil
++		}
++
++		// 2. rx power
++		rxOID := snmp.BuildWalkOID(snmp.OIDONURXPower, ifIndex)
++		if results, err := client.BulkWalk(rxOID); err == nil {
++			for _, pdu := range results {
++				if id, err := extractONUID(pdu.Name, rxOID); err == nil {
++					getItem(id).RXPower = convertPower(snmp.GetPDUInt(&pdu))
++				}
++			}
++		}
++
++		// 3. tx power
++		txOID := snmp.BuildWalkOID(snmp.OIDONUTXPower, ifIndex)
++		if results, err := client.BulkWalk(txOID); err == nil {
++			for _, pdu := range results {
++				if id, err := extractONUID(pdu.Name, txOID); err == nil {
++					getItem(id).TXPower = convertPower(snmp.GetPDUInt(&pdu))
++				}
++			}
++		}
++
++		// 4. nama/serial dari cache saja — tanpa walk
++		if s.cache != nil {
++			if namesData, nErr := s.cache.GetONUNames(ctx, oltID, board, pon); nErr == nil {
++				var names []domain.ONUNameEntry
++				if json.Unmarshal(namesData, &names) == nil {
++					namesMap := make(map[int]domain.ONUNameEntry, len(names))
++					for _, n := range names {
++						namesMap[n.OnuID] = n
++					}
++					for id, it := range onuMap {
++						if n, ok := namesMap[id]; ok {
++							it.Name = n.Name
++							it.SerialNumber = n.SerialNumber
++						}
++					}
++				}
++			}
++		}
++
++		items := make([]domain.ONUListItem, 0, len(onuMap))
++		for _, it := range onuMap {
++			items = append(items, *it)
++		}
++		sort.Slice(items, func(i, j int) bool { return items[i].OnuID < items[j].OnuID })
++
++		// tulis ke cache list: semua user dapat data segar tanpa walk ulang
++		if s.cache != nil && len(items) > 0 {
++			if data, mErr := json.Marshal(items); mErr == nil {
++				ttl := adaptiveTTL(cache.TTLONUList, time.Since(start))
++				if err := s.cache.SetONUListWithTTL(ctx, oltID, board, pon, data, ttl); err != nil {
++					log.Warn().Err(err).Msg("Gagal cache hasil live")
++				}
++			}
++		}
++
++		log.Debug().Int("count", len(items)).Dur("dur", time.Since(start)).
++			Msg("Live refresh selesai")
++		return items, nil
++	})
++	if err != nil {
++		return nil, err
++	}
++	return v.([]domain.ONUListItem), nil
+ }
+ 
+ // GetPONList retrieves list of PONs with descriptions for a specific board
+diff --git a/internal/snmp/client.go b/internal/snmp/client.go
+index 8a88a80..2d750d5 100644
+--- a/internal/snmp/client.go
++++ b/internal/snmp/client.go
+@@ -19,6 +19,20 @@ type Client struct {
+ 	mu     sync.Mutex
+ }
+ 
++// DefaultMaxRepetitions: titik aman untuk agen SNMP C320/C300 yang rawan.
++// Agen-nya jalan di CPU control-plane pas-pasan; response PDU raksasa
++// (repetitions besar) bikin CPU spike saat merakitnya. 20 = walk 64 ONU
++// selesai dalam ~4 round-trip (dulu ~21x di angka 3), tanpa PDU jumbo.
++// Override per OLT via SNMPConfig.MaxRepetitions bila terbukti perlu.
++const DefaultMaxRepetitions = 20
++
++func maxRepetitions(config domain.SNMPConfig) int {
++	if config.MaxRepetitions > 0 {
++		return config.MaxRepetitions
++	}
++	return DefaultMaxRepetitions
++}
++
+ // NewClient creates a new SNMP client
+ func NewClient(config domain.SNMPConfig) (*Client, error) {
+ 	// Set defaults
+@@ -44,7 +58,8 @@ func NewClient(config domain.SNMPConfig) (*Client, error) {
+ 			Version:         gosnmp.Version2c,
+ 			Timeout:         time.Duration(config.Timeout) * time.Second,
+ 			Retries:         config.Retries,
+-			MaxRepetitions:  3,
++			// PATCH(oltwtch): 3 -> 20 (lihat DefaultMaxRepetitions).
++			MaxRepetitions:  uint32(maxRepetitions(config)),
+ 		},
+ 	}
+ 

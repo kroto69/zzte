@@ -544,11 +544,29 @@ Returns lightweight list of ONUs on a PON port (only essential fields).
 | status | string | Human-readable status |
 | statusCode | int | Numeric status code (see Status Codes table) |
 | rxPower | float | RX power in dBm |
+| txPower | float | TX power in dBm (added: realtime patch) |
 
 **Cache Behavior (3-level fallback):**
 1. Complete list cache (Name populated) → returns in < 100ms
 2. Incomplete list + Names cache → merge, fast return
 3. No cache → on-demand SNMP walk (~7-12s), save to both caches
+
+---
+
+### Get ONU Live (realtime troubleshooting)
+
+```
+GET /api/v1/olt/{oltId}/board/{board}/pon/{pon}/live
+```
+
+Fresh per-PON status + Rx/Tx in one call (~1-5s depending on ONU count).
+Names/serials served from cache (no extra walks). Use for ODP
+troubleshooting instead of waiting for the background poller.
+Concurrent identical requests are de-duplicated (singleflight).
+
+**URL Parameters:** same as Get ONU List.
+
+**Response 200:** same shape as Get ONU List (includes `txPower`).
 
 ---
 
@@ -625,6 +643,69 @@ GET /api/v1/olt/{oltId}/board/{board}/pon
   ]
 }
 ```
+
+---
+
+## Event & Alert (up/down via syslog/trap — zero OLT polling)
+
+Event-driven ONU up/down. The OLT pushes events (syslog UDP 514 or SNMP
+trap UDP 162); zzte never polls for status on this path. Down causes are
+classified: `dying-gasp` = customer power, `los` = fiber, `unknown` otherwise.
+
+### Stream Events (SSE realtime)
+
+```
+GET /api/v1/events/stream
+```
+
+Server-Sent Events. Emits `event: onu` (raw up/down) and `event: alert`
+(anti-spam filtered). Includes `: ping` heartbeat every 25s.
+
+```
+event: onu
+data: {"oltId":"olt_1","board":1,"pon":2,"onuId":4,"kind":"down","cause":"los",...}
+
+event: alert
+data: {"id":"...","kind":"down","severity":"warning","message":"DOWN: olt_1 1/2:4 — ...",...}
+```
+
+### Recent Events
+
+```
+GET /api/v1/events/recent?limit=50
+```
+
+**Query Parameters:**
+
+| Param | Type | Description |
+|-------|------|-------------|
+| `limit` | int | Max entries (default 50, max 500, newest first) |
+
+### Alerts (anti-spam, for frontend)
+
+```
+GET /api/v1/alerts?limit=50
+```
+
+Down events after anti-spam filtering: 90s aggregation window, mass-down
+(≥5 ONUs per PON in window) collapsed into one alert, per-ONU cooldown
+60 min. Dying-gasp (power) reported with `info` severity instead of being
+paged as urgent.
+
+**Alert Fields:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| id | string | Alert ID |
+| oltId / board / pon / onuId | mixed | Location (`onuId: 0` = mass-down) |
+| kind | string | `down` \| `mass-down` |
+| cause | string | `power` \| `los` \| `unknown` \| `mass` |
+| count | int | ONU count (mass-down only) |
+| severity | string | `critical` (mass-down) \| `warning` (los/unknown) \| `info` (power) |
+| message | string | Human-readable (Indonesian) |
+| createdAt | string | ISO timestamp |
+
+**Query Parameters:** same `limit` semantics as Recent Events.
 
 ---
 

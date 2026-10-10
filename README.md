@@ -57,12 +57,24 @@ search:
   interval: 0        # interval dalam menit
 
 optical_poller:
-  enabled: true       # polling status + rx power
-  interval: 60        # detik
+  enabled: true       # polling status + rx power (jaring pengaman; realtime via /live & syslog)
+  interval: 600       # detik (10 menit — 60 dtk menyiksa OLT)
 
 names_poller:
   enabled: true       # polling nama + serial number
   interval: 28800      # detik (8 jam)
+
+event:
+  syslog:
+    enabled: false    # true bila OLT sudah dikonfigurasi kirim syslog ke server ini
+    port: 514         # butuh root/capability; alternatif: port bebas + DNAT
+    sources:          # opsional: IP pengirim -> oltID (kosong = fallback ke host SNMP OLT terdaftar)
+      # "192.168.1.100": "olt_1"
+  alert:
+    cooldown_minutes: 60    # 1 ONU max 1 alert per 60 menit
+    agg_window_seconds: 90   # kumpulkan down 90 dtk sebelum jadi alert
+    mass_threshold: 5        # >=5 down/PON dalam window = 1 alert mass-down
+    reverify: true            # verifikasi ulang status ONU via SNMP GET sebelum alert (anti false-alarm saat flapping)
 
 olts:
   olt_1:
@@ -72,6 +84,9 @@ olts:
     community: "public"
     timeout: 5
     retries: 2
+    max_repetitions: 0   # baris per BULK request; 0 = default aman (20).
+                         # C320/C300 rawan snmpwalk: jangan asal besar —
+                         # response PDU raksasa bikin CPU control-plane spike.
     poll_interval: 120   # detik, 0 = pakai global
     telnet:
       user: "zte"
@@ -274,6 +289,14 @@ curl http://localhost:8081/api/v1/olt/olt_1/board/1/pon/2
 | `fresh=true` | bool | Skip cache, force on-demand SNMP walk |
 | `refresh=true` | bool | Sama seperti `fresh=true` |
 
+#### Get ONU Live (jalur cepat troubleshooting)
+
+Satu PON port: status + Rx/Tx segar (±2–4 dtk), nama/SN dari cache. Untuk troubleshooting ODP tanpa menunggu poller dan tanpa menyiksa OLT.
+
+```bash
+curl http://localhost:8081/api/v1/olt/olt_1/board/1/pon/2/live
+```
+
 #### Get ONU Detail
 
 ```bash
@@ -313,6 +336,28 @@ curl http://localhost:8081/api/v1/olt/olt_1/info
 # Health Check
 curl http://localhost:8081/api/v1/olt/olt_1/health
 ```
+
+### Event & Alert (up/down via syslog — nol beban OLT)
+
+Aktifkan dulu di OLT (arahkan syslog ke IP:port server ini) dan `event.syslog.enabled: true`.
+Klasifikasi penyebab down otomatis: `dying-gasp` = listrik pelanggan, `los` = fiber.
+
+```bash
+# Alert down yang lolos anti-spam (untuk ditampilkan frontend)
+curl http://localhost:8081/api/v1/alerts?limit=50
+
+# Response: [{id, oltId, board, pon, onuId, kind: "down"|"mass-down",
+#             cause, count, severity: "critical"|"warning"|"info",
+#             message, createdAt}]
+
+# Event log terakhir
+curl http://localhost:8081/api/v1/events/recent?limit=50
+
+# Stream realtime (Server-Sent Events): event: onu | event: alert
+curl -N http://localhost:8081/api/v1/events/stream
+```
+
+Lihat [ROADMAP.md](ROADMAP.md) untuk status pengerjaan & langkah berikutnya.
 
 ## SNMP OID Reference
 

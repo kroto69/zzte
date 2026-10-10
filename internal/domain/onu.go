@@ -25,6 +25,7 @@ type ONU struct {
 }
 
 // ONUListItem is the lightweight response for list endpoints (only populated fields)
+// PATCH(oltwtch): tambah TXPower — endpoint /live butuh realtime tx+rx per ONU.
 type ONUListItem struct {
 	OltID        string  `json:"oltId"`
 	Board        int     `json:"board"`
@@ -35,6 +36,7 @@ type ONUListItem struct {
 	Status       string  `json:"status"`
 	StatusCode   int     `json:"statusCode"`
 	RXPower      float64 `json:"rxPower"`
+	TXPower      float64 `json:"txPower,omitempty"`
 }
 
 // ONUNameEntry caches static ONU identity (Name + SerialNumber) with long TTL
@@ -56,6 +58,7 @@ func (o *ONU) ToListItem() ONUListItem {
 		Status:       o.Status,
 		StatusCode:   o.StatusCode,
 		RXPower:      o.RXPower,
+		TXPower:      o.TXPower,
 	}
 }
 

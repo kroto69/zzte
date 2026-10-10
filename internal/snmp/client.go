@@ -19,6 +19,20 @@ type Client struct {
 	mu     sync.Mutex
 }
 
+// DefaultMaxRepetitions: titik aman untuk agen SNMP C320/C300 yang rawan.
+// Agen-nya jalan di CPU control-plane pas-pasan; response PDU raksasa
+// (repetitions besar) bikin CPU spike saat merakitnya. 20 = walk 64 ONU
+// selesai dalam ~4 round-trip (dulu ~21x di angka 3), tanpa PDU jumbo.
+// Override per OLT via SNMPConfig.MaxRepetitions bila terbukti perlu.
+const DefaultMaxRepetitions = 20
+
+func maxRepetitions(config domain.SNMPConfig) int {
+	if config.MaxRepetitions > 0 {
+		return config.MaxRepetitions
+	}
+	return DefaultMaxRepetitions
+}
+
 // NewClient creates a new SNMP client
 func NewClient(config domain.SNMPConfig) (*Client, error) {
 	// Set defaults
@@ -44,7 +58,8 @@ func NewClient(config domain.SNMPConfig) (*Client, error) {
 			Version:         gosnmp.Version2c,
 			Timeout:         time.Duration(config.Timeout) * time.Second,
 			Retries:         config.Retries,
-			MaxRepetitions:  3,
+			// PATCH(oltwtch): 3 -> 20 (lihat DefaultMaxRepetitions).
+			MaxRepetitions:  uint32(maxRepetitions(config)),
 		},
 	}
 

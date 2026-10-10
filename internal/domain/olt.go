@@ -11,6 +11,11 @@ type SNMPConfig struct {
 	Community string `json:"community"`
 	Timeout   int    `json:"timeout,omitempty"` // seconds, default 5
 	Retries   int    `json:"retries,omitempty"` // default 2
+	// MaxRepetitions jumlah baris per BULK request. 0 = pakai default aman.
+	// CATATAN C320/C300: agen SNMP-nya jalan di CPU control-plane yang pas-pasan;
+	// response raksasa (repetitions besar) bikin CPU spike saat merakit PDU.
+	// Jangan asal besar — 20 adalah titik aman (lihat DefaultMaxRepetitions).
+	MaxRepetitions int `json:"maxRepetitions,omitempty"`
 }
 
 // TelnetConfig holds Telnet credentials

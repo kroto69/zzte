@@ -8,6 +8,8 @@ import (
 
 	"github.com/redis/go-redis/v9"
 	"github.com/rs/zerolog/log"
+
+	"olt-monitor/internal/domain"
 )
 
 // TTL constants for different cache types
@@ -32,6 +34,13 @@ const (
 	KeyPONList     = "olt:%s:board:%d:pon:list"
 	KeyOLTPattern  = "olt:%s:*"
 	KeyActivityLog = "activity:log"
+	// PATCH(oltwtch-event): kunci event-driven
+	KeyEventBus  = "zzte:events"     // pub/sub channel
+	KeyEventLog  = "zzte:events:log" // list terbatas
+	KeyAlertBus  = "zzte:alerts"     // pub/sub channel alert
+	KeyAlertLog  = "zzte:alerts:log" // list alert terbatas
+	MaxEventEntries = 500
+	MaxAlertEntries = 500
 )
 
 // RedisCache wraps Redis client with OLT-specific operations
@@ -273,4 +282,135 @@ func (c *RedisCache) SetJSON(ctx context.Context, key string, value interface{},
 // Ping checks Redis connectivity
 func (c *RedisCache) Ping(ctx context.Context) error {
 	return c.client.Ping(ctx).Err()
+}
+
+// ---- PATCH(oltwtch-event): method untuk jalur event-driven ----
+
+// PublishEvent publikasikan event ke pub/sub untuk dashboard realtime (SSE).
+func (c *RedisCache) PublishEvent(ctx context.Context, data []byte) error {
+	return c.client.Publish(ctx, KeyEventBus, data).Err()
+}
+
+// SubscribeEvents kembalikan channel pub/sub. Tutup via close().
+func (c *RedisCache) SubscribeEvents(ctx context.Context) (<-chan []byte, func()) {
+	sub := c.client.Subscribe(ctx, KeyEventBus)
+	ch := make(chan []byte, 128)
+	go func() {
+		defer close(ch)
+		for msg := range sub.Channel() {
+			select {
+			case ch <- []byte(msg.Payload):
+			default:
+			}
+		}
+	}()
+	return ch, func() { sub.Close() }
+}
+
+// AppendEventLog simpan event ke log terbatas (LPush + LTrim).
+func (c *RedisCache) AppendEventLog(ctx context.Context, data []byte) error {
+	pipe := c.client.Pipeline()
+	pipe.LPush(ctx, KeyEventLog, data)
+	pipe.LTrim(ctx, KeyEventLog, 0, MaxEventEntries-1)
+	_, err := pipe.Exec(ctx)
+	return err
+}
+
+// RecentEvents ambil N event terakhir (terbaru dulu).
+func (c *RedisCache) RecentEvents(ctx context.Context, limit int) ([][]byte, error) {
+	if limit <= 0 || limit > MaxEventEntries {
+		limit = 50
+	}
+	strs, err := c.client.LRange(ctx, KeyEventLog, 0, int64(limit-1)).Result()
+	if err != nil {
+		return nil, err
+	}
+	out := make([][]byte, 0, len(strs))
+	for _, s := range strs {
+		out = append(out, []byte(s))
+	}
+	return out, nil
+}
+
+// PublishAlert publikasikan alert ke pub/sub untuk dashboard realtime.
+func (c *RedisCache) PublishAlert(ctx context.Context, data []byte) error {
+	return c.client.Publish(ctx, KeyAlertBus, data).Err()
+}
+
+// SubscribeAlerts kembalikan channel pub/sub alert. Tutup via close().
+func (c *RedisCache) SubscribeAlerts(ctx context.Context) (<-chan []byte, func()) {
+	sub := c.client.Subscribe(ctx, KeyAlertBus)
+	ch := make(chan []byte, 128)
+	go func() {
+		defer close(ch)
+		for msg := range sub.Channel() {
+			select {
+			case ch <- []byte(msg.Payload):
+			default:
+			}
+		}
+	}()
+	return ch, func() { sub.Close() }
+}
+
+// AppendAlert simpan alert ke log terbatas (LPush + LTrim).
+func (c *RedisCache) AppendAlert(ctx context.Context, data []byte) error {
+	pipe := c.client.Pipeline()
+	pipe.LPush(ctx, KeyAlertLog, data)
+	pipe.LTrim(ctx, KeyAlertLog, 0, MaxAlertEntries-1)
+	_, err := pipe.Exec(ctx)
+	return err
+}
+
+// RecentAlerts ambil N alert terakhir (terbaru dulu).
+func (c *RedisCache) RecentAlerts(ctx context.Context, limit int) ([][]byte, error) {
+	if limit <= 0 || limit > MaxAlertEntries {
+		limit = 50
+	}
+	strs, err := c.client.LRange(ctx, KeyAlertLog, 0, int64(limit-1)).Result()
+	if err != nil {
+		return nil, err
+	}
+	out := make([][]byte, 0, len(strs))
+	for _, s := range strs {
+		out = append(out, []byte(s))
+	}
+	return out, nil
+}
+
+// PatchONUStatus update status 1 ONU di cache list PON (read-modify-write).
+// Dipakai jalur event agar dashboard langsung segar tanpa walk SNMP.
+// Bila cache kosong, kembalikan redis.Nil (poller yang akan mengisi).
+func (c *RedisCache) PatchONUStatus(ctx context.Context, oltID string, board, pon, onuID int, status string, statusCode int) error {
+	key := fmt.Sprintf(KeyONUList, oltID, board, pon)
+	data, err := c.client.Get(ctx, key).Bytes()
+	if err != nil {
+		return err
+	}
+	var items []domain.ONUListItem
+	if err := json.Unmarshal(data, &items); err != nil {
+		return err
+	}
+	found := false
+	for i := range items {
+		if items[i].OnuID == onuID {
+			items[i].Status = status
+			items[i].StatusCode = statusCode
+			found = true
+			break
+		}
+	}
+	if !found {
+		return fmt.Errorf("onu %d tidak ada di cache list", onuID)
+	}
+	ttl, err := c.client.TTL(ctx, key).Result()
+	if err != nil || ttl <= 0 {
+		ttl = TTLONUList
+	}
+	return c.SetONUListWithTTL(ctx, oltID, board, pon, mustJSON(items), ttl)
+}
+
+func mustJSON(v interface{}) []byte {
+	data, _ := json.Marshal(v)
+	return data
 }

@@ -15,7 +15,7 @@ import (
 )
 
 // NewRouter creates and configures the Chi router
-func NewRouter(oltHandler *OLTHandler, onuHandler *ONUHandler, authHandler *AuthHandler, userHandler *UserHandler, systemHandler *SystemHandler, searchHandler *SearchHandler, controlHandler *ControlHandler, provisioningHandler *ProvisioningHandler, activityHandler *ActivityHandler) *chi.Mux {
+func NewRouter(oltHandler *OLTHandler, onuHandler *ONUHandler, authHandler *AuthHandler, userHandler *UserHandler, systemHandler *SystemHandler, searchHandler *SearchHandler, controlHandler *ControlHandler, provisioningHandler *ProvisioningHandler, activityHandler *ActivityHandler, eventHandler *EventHandler) *chi.Mux {
 	r := chi.NewRouter()
 
 	// Middleware
@@ -57,6 +57,8 @@ func NewRouter(oltHandler *OLTHandler, onuHandler *ONUHandler, authHandler *Auth
 
 				// ONU routes
 				r.Get("/olt/{oltId}/board/{board}/pon/{pon}", onuHandler.GetONUList)
+				// PATCH(oltwtch): jalur cepat troubleshooting — status + rx/tx segar per PON
+				r.Get("/olt/{oltId}/board/{board}/pon/{pon}/live", onuHandler.GetONULive)
 				r.Get("/olt/{oltId}/board/{board}/pon/{pon}/onu/{onuId}", onuHandler.GetONUDetail)
 				r.Get("/olt/{oltId}/board/{board}/pon", onuHandler.GetPONList)
 
@@ -70,6 +72,12 @@ func NewRouter(oltHandler *OLTHandler, onuHandler *ONUHandler, authHandler *Auth
 				// Search routes (read)
 				r.Get("/search", searchHandler.Search)
 				r.Get("/search/stats", searchHandler.GetStats)
+
+				// PATCH(oltwtch-event): event up/down via syslog (SSE realtime + log)
+				r.Get("/events/stream", eventHandler.Stream)
+				r.Get("/events/recent", eventHandler.Recent)
+				// PATCH(oltwtch-alert): alert down anti-spam untuk frontend
+				r.Get("/alerts", eventHandler.Alerts)
 			})
 
 			r.Group(func(r chi.Router) {
@@ -145,7 +153,10 @@ func SetupRoutes(cfg *config.Config, manager *service.OLTManager, onuService *se
 	provisioningService := service.NewProvisioningService(manager, telnetService)
 	provisioningHandler := NewProvisioningHandler(provisioningService, manager, activityService)
 
-	r := NewRouter(oltHandler, onuHandler, authHandler, userHandler, systemHandler, searchHandler, controlHandler, provisioningHandler, activityHandler)
+	// PATCH(oltwtch-event): handler event up/down (SSE + recent)
+	eventHandler := NewEventHandler(cache)
+
+	r := NewRouter(oltHandler, onuHandler, authHandler, userHandler, systemHandler, searchHandler, controlHandler, provisioningHandler, activityHandler, eventHandler)
 
 	return r
 }

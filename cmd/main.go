@@ -12,10 +12,12 @@ import (
 
 	"olt-monitor/internal/cache"
 	"olt-monitor/internal/config"
+	"olt-monitor/internal/event"
 	"olt-monitor/internal/handler"
 	"olt-monitor/internal/poller"
 	"olt-monitor/internal/server"
 	"olt-monitor/internal/service"
+	"olt-monitor/internal/snmp"
 )
 
 func main() {
@@ -59,7 +61,10 @@ func main() {
 	}
 
 	// Create services
-	onuService := service.NewONUService(manager, redisCache)
+	// PATCH(oltwtch-2): tracker port panas — dipakai service (menandai) dan
+	// poller (memprioritaskan). Lihat internal/service/hot_tracker.go.
+	hotTracker := service.NewHotTracker()
+	onuService := service.NewONUService(manager, redisCache, hotTracker)
 	indexerService := service.NewIndexerService(manager, redisCache, cfg)
 
 	// Context untuk graceful shutdown
@@ -69,7 +74,7 @@ func main() {
 	// Start optical poller jika enabled
 	var opticalPoller *poller.OpticalPoller
 	if cfg.OpticalPoller.Enabled {
-		opticalPoller = poller.NewOpticalPoller(manager, redisCache, cfg)
+		opticalPoller = poller.NewOpticalPoller(manager, redisCache, cfg, hotTracker)
 		opticalPoller.Start(ctx)
 		log.Info().Int("interval", cfg.OpticalPoller.Interval).Msg("Optical poller started")
 	}
@@ -87,6 +92,73 @@ func main() {
 		indexerService.StartBackgroundSync(time.Duration(cfg.Search.Interval) * time.Minute)
 	}
 
+	// PATCH(oltwtch-event): jalur event-driven via syslog dari OLT.
+	// PRINSIP: OLT hanya didengarkan, tidak ditanya — nol beban polling/status.
+	// Multi-OLT: IP pengirim di-resolve ke oltID (config eksplisit atau
+	// fallback ke host SNMP OLT terdaftar).
+	eventBus := event.NewBus(1024)
+	eventBus.Start()
+	defer eventBus.Close()
+
+	eventMapper := event.NewMapper(manager)
+	eventMapper.SetSources(cfg.Event.Syslog.Sources)
+
+	// Sink Redis: patch status instan + pub/sub realtime + event log.
+	eventSink := event.NewSink(redisCache)
+	eventBus.Subscribe(eventSink.Handle)
+
+	// PATCH(oltwtch-alert): mesin alert — event down yang lolos anti-spam
+	// (agregasi + cooldown) disimpan di Redis dan diekspos via
+	// GET /api/v1/alerts untuk ditampilkan frontend. Tanpa WA.
+	alertEngine := event.NewEngine(event.AlertConfig{
+		Cooldown:      time.Duration(cfg.Event.Alert.CooldownMinutes) * time.Minute,
+		AggWindow:     time.Duration(cfg.Event.Alert.AggWindowSeconds) * time.Second,
+		MassThreshold: cfg.Event.Alert.MassThreshold,
+	}, redisCache)
+	if cfg.Event.Alert.Reverify {
+		// PATCH(oltwtch-alert): verifikasi ulang status ONU tepat sebelum
+		// alert diterbitkan — satu SNMP GET terarah, bukan polling.
+		// Kalau ONU sudah online lagi (status 3), alert dibuang: ini
+		// menutup false-alarm klasik saat syslog LOS tapi ONU sudah
+		// kembali up. Kesalahan SNMP -> trust syslog (alert tetap keluar).
+		alertEngine.SetVerifier(func(ev event.Event) bool {
+			cl, err := manager.GetNewClient(ev.OLTID)
+			if err != nil {
+				return true
+			}
+			if err := cl.Connect(); err != nil {
+				return true
+			}
+			defer cl.Close()
+			ifIndex := snmp.CalculateIfIndexDefault(ev.Board, ev.Pon)
+			oid := snmp.BuildONUOID(snmp.OIDONUStatus, ifIndex, ev.OnuID, "")
+			st, err := cl.GetInt(oid)
+			if err != nil {
+				return true
+			}
+			return st != 3 // 3 = online
+		})
+	}
+	eventBus.Subscribe(alertEngine.Handle)
+	alertEngine.Start()
+	defer alertEngine.Stop()
+	log.Info().Msg("Alert engine aktif (anti-spam: agregasi + cooldown, via /api/v1/alerts)")
+
+	var syslogStop chan struct{}
+	if cfg.Event.Syslog.Enabled {
+		syslogStop = make(chan struct{})
+		syslogSrv := event.NewServer(eventBus, eventMapper, cfg.Event.Syslog.Port)
+		go func() {
+			if err := syslogSrv.Serve(syslogStop); err != nil {
+				log.Error().Err(err).Msg("Syslog server berhenti dengan error")
+			}
+		}()
+		log.Info().Int("port", cfg.Event.Syslog.Port).
+			Msg("Syslog listener aktif — arahkan syslog OLT ke IP:port ini")
+	} else {
+		log.Info().Msg("Event syslog nonaktif (event.syslog.enabled=false)")
+	}
+
 	// Setup HTTP server
 	router := handler.SetupRoutes(cfg, manager, onuService, indexerService, redisCache)
 	srv := server.NewServer(cfg, router)
@@ -100,6 +172,9 @@ func main() {
 
 		cancel() // Batalkan context poller
 
+		if syslogStop != nil {
+			close(syslogStop)
+		}
 		if opticalPoller != nil {
 			opticalPoller.Stop()
 		}

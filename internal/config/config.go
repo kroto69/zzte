@@ -16,6 +16,7 @@ type Config struct {
 	Search        SearchConfig           `mapstructure:"search"`
 	OpticalPoller OpticalPollerConfig    `mapstructure:"optical_poller"`
 	NamesPoller   NamesPollerConfig      `mapstructure:"names_poller"`
+	Event         EventConfig            `mapstructure:"event"`
 	OLTs          map[string]OLTConfig   `mapstructure:"olts"`
 	Users         map[string]UserAccount `mapstructure:"users"`
 	v             *viper.Viper
@@ -31,6 +32,31 @@ type OpticalPollerConfig struct {
 type NamesPollerConfig struct {
 	Enabled  bool `mapstructure:"enabled"`
 	Interval int  `mapstructure:"interval"` // dalam detik
+}
+
+// EventConfig konfigurasi jalur event-driven (syslog dari OLT).
+// Prinsip: OLT hanya didengarkan, tidak ditanya — nol beban polling.
+type EventConfig struct {
+	Syslog EventSyslogConfig `mapstructure:"syslog"`
+	Alert  EventAlertConfig  `mapstructure:"alert"`
+}
+
+// EventSyslogConfig: UDP listener untuk syslog OLT.
+type EventSyslogConfig struct {
+	Enabled bool              `mapstructure:"enabled"`
+	Port    int               `mapstructure:"port"` // default 514; butuh root/capability
+	Sources map[string]string `mapstructure:"sources"`
+	// sources: IP pengirim -> oltID, mis. {"192.168.1.100": "olt-jkt"}.
+	// Kosong = fallback otomatis ke host SNMP OLT terdaftar.
+}
+
+// EventAlertConfig: alert down anti-spam, diekspos via GET /api/v1/alerts
+// untuk ditampilkan frontend (tanpa ketergantungan layanan pihak ketiga).
+type EventAlertConfig struct {
+	CooldownMinutes  int  `mapstructure:"cooldown_minutes"`
+	AggWindowSeconds int  `mapstructure:"agg_window_seconds"`
+	MassThreshold    int  `mapstructure:"mass_threshold"`
+	Reverify         bool `mapstructure:"reverify"` // SNMP GET status sebelum alert (anti false-alarm flapping)
 }
 
 // ServerConfig holds application settings
@@ -63,6 +89,9 @@ type OLTConfig struct {
 	Community    string            `mapstructure:"community"`
 	Timeout      int               `mapstructure:"timeout"`
 	Retries      int               `mapstructure:"retries"`
+	// MaxRepetitions: baris per BULK request. 0 = default aman (20).
+	// Naikkan hanya bila OLT terbukti kuat; C320/C300 yang rawan jangan.
+	MaxRepetitions int             `mapstructure:"max_repetitions"`
 	PollInterval int               `mapstructure:"poll_interval"` // detik, 0 = pakai global
 	Telnet       TelnetConfig      `mapstructure:"telnet"`
 	VlanProfiles map[string]string `mapstructure:"vlan_profiles"`
@@ -95,9 +124,20 @@ func Load(path string) (*Config, error) {
 	v.SetDefault("search.enabled", false)
 	v.SetDefault("search.interval", 0)
 	v.SetDefault("optical_poller.enabled", true)
-	v.SetDefault("optical_poller.interval", 60)
+	// PATCH(oltwtch): 60 -> 600. Poller 60 detik menumpuk (satu siklus
+	// 32 PON port bisa >60 detik) dan menyiksa OLT. Data real-time saat
+	// troubleshooting diambil via endpoint /live, bukan dari poller.
+	v.SetDefault("optical_poller.interval", 600)
 	v.SetDefault("names_poller.enabled", true)
 	v.SetDefault("names_poller.interval", 28800)
+	// PATCH(oltwtch-event): jalur event-driven via syslog (default nonaktif
+	// sampai OLT dikonfigurasi mengirim syslog ke server ini).
+	v.SetDefault("event.syslog.enabled", false)
+	v.SetDefault("event.syslog.port", 514)
+	v.SetDefault("event.alert.cooldown_minutes", 60)
+	v.SetDefault("event.alert.agg_window_seconds", 90)
+	v.SetDefault("event.alert.mass_threshold", 5)
+	v.SetDefault("event.alert.reverify", true)
 
 	// Config file
 	v.SetConfigName("olt_config")
