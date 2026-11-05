@@ -122,10 +122,20 @@ func OfflineCodeToString(code int) string {
 	}
 }
 
+// ToSigned16 reinterprets a raw SNMP value as a signed 16-bit integer.
+// The OLT reports optical power in two's complement: a real reading of
+// -30.456 dBm arrives as the unsigned value 65308 (=-228). Treating it as
+// unsigned produced the absurd +100.616 dBm seen before this fix.
+func ToSigned16(raw int) int {
+	if raw > 32767 {
+		return raw - 65536
+	}
+	return raw
+}
+
 // SanitizePower returns 0.0 ("no reading") when a converted dBm value is
-// physically impossible for GPON optics. A dead or LOS ONU makes the OLT
-// return near-sentinel raw values (e.g. 65308, close to the 65535 marker)
-// that would otherwise convert to absurd values such as +100.616 dBm.
+// physically impossible for GPON optics (e.g. a dead ONU returning a
+// sentinel-like raw that converts outside the window).
 // Real GPON readings live roughly between -40 dBm and +5 dBm; the
 // [-50, +10] window is deliberately generous so no real reading is dropped.
 func SanitizePower(dbm float64) float64 {
@@ -135,8 +145,18 @@ func SanitizePower(dbm float64) float64 {
 	return dbm
 }
 
-// ConvertPower converts raw SNMP power value to dBm
-// Formula: (raw - 10000) / 100
+// ConvertPower converts raw SNMP power value to dBm.
+// Formula: (signed16(raw) - 15000) / 500 — the same formula as the
+// V1/V2 adapters. Proven against NetNumen on a live OLT: raw 65308
+// (=-228) converts to -30.456 dBm, matching NetNumen's ~-30 dBm.
+// (The earlier (raw-10000)/100 formula was wrong: it gives -102.28 dBm
+// for the same raw value.)
+// Sentinel raw values 0 and 65535 mean "no reading" and are checked
+// BEFORE the signed reinterpretation: 65535 as signed would be -1,
+// which would falsely convert to -30.002 dBm.
 func ConvertPower(raw int) float64 {
-	return SanitizePower(float64(raw-10000) / 100.0)
+	if raw == 65535 || raw == 0 {
+		return 0.0
+	}
+	return SanitizePower(float64(ToSigned16(raw)-15000) / 500.0)
 }

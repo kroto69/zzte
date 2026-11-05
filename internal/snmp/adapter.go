@@ -40,29 +40,31 @@ func (a *BaseAdapter) GetFullVersion() string {
 }
 
 // ConvertPower converts raw power value to dBm
-// Universal formula for V1 and V2: (raw - 15000) / 500
+// Universal formula for V1 and V2: (signed16(raw) - 15000) / 500
 func (a *V1Adapter) ConvertPower(raw int) float64 {
-	// Special values
+	// Special values (checked BEFORE the signed reinterpretation:
+	// 65535 as signed would be -1, falsely converting to -30.002 dBm)
 	if raw == 65535 || raw == 0 {
 		return 0.0
 	}
-	// Universal: (raw - 15000) / 500
-	// Sanitize: a dead/LOS ONU returns near-sentinel raw values (e.g. 65308)
-	// that would otherwise convert to impossible values like +100.616 dBm.
-	return domain.SanitizePower(float64(raw-15000) / 500.0)
+	// Universal: (signed16(raw) - 15000) / 500.
+	// The OLT sends negative readings as unsigned two's complement
+	// (e.g. -30.456 dBm arrives as 65308); see domain.ToSigned16.
+	return domain.SanitizePower(float64(domain.ToSigned16(raw)-15000) / 500.0)
 }
 
 // ConvertPower converts raw power value to dBm
-// Universal formula for V1 and V2: (raw - 15000) / 500
+// Universal formula for V1 and V2: (signed16(raw) - 15000) / 500
 func (a *V2Adapter) ConvertPower(raw int) float64 {
-	// Special values
+	// Special values (checked BEFORE the signed reinterpretation:
+	// 65535 as signed would be -1, falsely converting to -30.002 dBm)
 	if raw == 65535 || raw == 0 {
 		return 0.0
 	}
-	// Universal: (raw - 15000) / 500
-	// Sanitize: a dead/LOS ONU returns near-sentinel raw values (e.g. 65308)
-	// that would otherwise convert to impossible values like +100.616 dBm.
-	return domain.SanitizePower(float64(raw-15000) / 500.0)
+	// Universal: (signed16(raw) - 15000) / 500.
+	// The OLT sends negative readings as unsigned two's complement
+	// (e.g. -30.456 dBm arrives as 65308); see domain.ToSigned16.
+	return domain.SanitizePower(float64(domain.ToSigned16(raw)-15000) / 500.0)
 }
 
 // DetectFirmware auto-detects firmware version from OLT

@@ -2,24 +2,27 @@ package domain
 
 import "testing"
 
-// Same guard as the adapter path: out-of-range converted values are
-// "no reading" (0.0), never an impossible dBm figure.
+// Same conversion as the adapters: signed 16-bit raw, formula
+// (signed16(raw) - 15000) / 500, sanitized to [-50, +10] dBm.
+// Proven against NetNumen: raw 65308 (=-228) is a real -30.456 dBm reading.
 func TestConvertPower(t *testing.T) {
 	cases := []struct {
 		name string
 		raw  int
 		want float64
 	}{
-		{"normal RX", 8150, -18.5},
-		{"normal TX", 10500, 5.0},
-		{"zero dBm", 10000, 0.0},
-		{"near-sentinel garbage", 65308, 0.0},
+		{"normal RX", 5750, -18.5},
+		{"normal TX", 17500, 5.0},
+		{"zero dBm", 15000, 0.0},
+		{"negative reading (NetNumen -30)", 65308, -30.456},
+		{"negative reading, signed input", -228, -30.456},
 		{"sentinel 65535", 65535, 0.0},
 		{"sentinel 0", 0, 0.0},
-		{"upper boundary valid", 11000, 10.0},
-		{"just above upper boundary", 11001, 0.0},
-		{"lower boundary valid", 5000, -50.0},
-		{"just below lower boundary", 4999, 0.0},
+		{"upper boundary valid", 20000, 10.0},
+		{"just above upper boundary", 20001, 0.0},
+		{"lower boundary valid", -10000, -50.0},
+		{"just below lower boundary", -10001, 0.0},
+		{"out-of-range garbage", 40000, 0.0},
 	}
 	for _, tc := range cases {
 		if got := ConvertPower(tc.raw); got != tc.want {
