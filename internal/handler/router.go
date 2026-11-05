@@ -59,6 +59,7 @@ func NewRouter(oltHandler *OLTHandler, onuHandler *ONUHandler, authHandler *Auth
 				r.Get("/olt/{oltId}/board/{board}/pon/{pon}", onuHandler.GetONUList)
 				r.Get("/olt/{oltId}/board/{board}/pon/{pon}/onu/{onuId}", onuHandler.GetONUDetail)
 				r.Get("/olt/{oltId}/board/{board}/pon", onuHandler.GetPONList)
+				r.Get("/olt/{oltId}/boards", onuHandler.GetBoards)
 
 				// Control routes
 				r.Post("/onu/reboot", controlHandler.RebootONU)

@@ -491,3 +491,41 @@ func (s *ONUService) GetPONList(ctx context.Context, oltID string, board int) ([
 
 	return descriptions, nil
 }
+
+// GetBoards returns the distinct slot numbers that have PON ports,
+// discovered from a single SNMP walk of the PON description table.
+// This reflects the OLT's actual populated slots (e.g. [1, 2] on a
+// 2-slot C320) instead of a hardcoded range. A slot with no PON
+// description entries is not reported.
+func (s *ONUService) GetBoards(ctx context.Context, oltID string) ([]int, error) {
+	client, err := s.manager.GetClient(oltID)
+	if err != nil {
+		return nil, err
+	}
+
+	results, err := client.Walk(snmp.OIDPONDescription)
+	if err != nil {
+		return nil, fmt.Errorf("SNMP walk failed: %w", err)
+	}
+
+	seen := make(map[int]struct{})
+	for _, pdu := range results {
+		suffix := strings.TrimPrefix(pdu.Name, snmp.OIDPONDescription+".")
+		if suffix == pdu.Name {
+			continue
+		}
+		ifIndex, err := strconv.Atoi(suffix)
+		if err != nil {
+			continue
+		}
+		_, slot, _ := snmp.ParseIfIndex(ifIndex)
+		seen[slot] = struct{}{}
+	}
+
+	boards := make([]int, 0, len(seen))
+	for slot := range seen {
+		boards = append(boards, slot)
+	}
+	sort.Ints(boards)
+	return boards, nil
+}

@@ -140,6 +140,21 @@ func (h *ONUHandler) GetONUDetail(w http.ResponseWriter, r *http.Request) {
 	Success(w, onu)
 }
 
+// GetBoards returns distinct slot numbers that have PON ports
+// GET /api/v1/olt/{oltId}/boards
+func (h *ONUHandler) GetBoards(w http.ResponseWriter, r *http.Request) {
+	oltID := chi.URLParam(r, "oltId")
+
+	boards, err := h.onuService.GetBoards(r.Context(), oltID)
+	if err != nil {
+		log.Error().Err(err).Msg("Failed to get board list")
+		InternalError(w, err.Error())
+		return
+	}
+
+	Success(w, boards)
+}
+
 // GetPONList returns list of PONs with descriptions
 // GET /api/v1/olt/{oltId}/board/{board}/pon
 func (h *ONUHandler) GetPONList(w http.ResponseWriter, r *http.Request) {
