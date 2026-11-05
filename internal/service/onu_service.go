@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gosnmp/gosnmp"
@@ -91,9 +92,8 @@ func (s *ONUService) GetONUList(ctx context.Context, oltID string, board, pon in
 	// Deduplikasi request SNMP untuk OLT+board+pon yang sama
 	sfKey := fmt.Sprintf("onulist:%s:%d:%d", oltID, board, pon)
 	v, err, _ := s.sfGroup.Do(sfKey, func() (interface{}, error) {
-		// Get SNMP client
-		client, err := s.manager.GetClient(oltID)
-		if err != nil {
+		// Existence check; walks below use isolated clients (see below).
+		if _, err := s.manager.GetClient(oltID); err != nil {
 			return nil, err
 		}
 
@@ -130,21 +130,100 @@ func (s *ONUService) GetONUList(ctx context.Context, oltID string, board, pon in
 			return onuMap[id]
 		}
 
-		// 1. Walk Status (discovery + status)
-		statusOID := snmp.BuildWalkOID(snmp.OIDONUStatus, ifIndex)
-		log.Debug().Str("oid", statusOID).Msg("Walking ONU status")
+		// The 4 walks are independent (every PDU carries its ONU id in the OID
+		// suffix), so run them in parallel on isolated SNMP clients.
+		// snmp.Client serializes internally, and the background pollers already
+		// prove the OLT tolerates several concurrent SNMP sessions.
+		// NOTE: Offline reason is intentionally not walked for list to keep it fast.
+		adapter, _ := s.manager.GetAdapter(oltID)
 
-		statusResults, err := client.BulkWalk(statusOID)
-		if err != nil {
-			log.Error().Err(err).Msg("Failed to walk ONU status")
-			return nil, fmt.Errorf("SNMP walk failed: %w", err)
+		type onuWalk struct {
+			key string
+			oid string
+		}
+		walks := []onuWalk{
+			{key: "status", oid: snmp.BuildWalkOID(snmp.OIDONUStatus, ifIndex)},
+			{key: "name", oid: snmp.BuildWalkOID(snmp.OIDONUName, ifIndex)},
+			{key: "sn", oid: snmp.BuildWalkOID(snmp.OIDONUSerialNumber, ifIndex)},
+			{key: "rx", oid: snmp.BuildWalkOID(snmp.OIDONURXPower, ifIndex)},
+		}
+		walkOIDByKey := make(map[string]string, len(walks))
+		for _, w := range walks {
+			walkOIDByKey[w.key] = w.oid
 		}
 
-		for _, pdu := range statusResults {
-			if id, err := extractONUID(pdu.Name, statusOID); err == nil {
-				onu := getONU(id)
-				onu.Status = snmp.ParseONUStatus(&pdu)
-				onu.StatusCode = snmp.ParseStatusToInt(&pdu)
+		type walkOutcome struct {
+			key  string
+			pdus []gosnmp.SnmpPDU
+			err  error
+		}
+		outcomes := make([]walkOutcome, len(walks))
+		var walkWg sync.WaitGroup
+		for i, w := range walks {
+			walkWg.Add(1)
+			go func(i int, key, oid string) {
+				defer walkWg.Done()
+				walkClient, err := s.manager.GetNewClient(oltID)
+				if err != nil {
+					outcomes[i] = walkOutcome{key: key, err: err}
+					return
+				}
+				if err := walkClient.Connect(); err != nil {
+					outcomes[i] = walkOutcome{key: key, err: fmt.Errorf("SNMP connect failed: %w", err)}
+					return
+				}
+				defer walkClient.Close()
+				log.Debug().Str("walk", key).Str("oid", oid).Msg("Walking ONU data")
+				pdus, err := walkClient.BulkWalk(oid)
+				outcomes[i] = walkOutcome{key: key, pdus: pdus, err: err}
+			}(i, w.key, w.oid)
+		}
+		walkWg.Wait()
+
+		for _, outcome := range outcomes {
+			if outcome.err != nil {
+				// The status walk is the discovery source: its failure fails
+				// the request. The other walks stay best-effort, as before.
+				if outcome.key == "status" {
+					log.Error().Err(outcome.err).Msg("Failed to walk ONU status")
+					return nil, fmt.Errorf("SNMP walk failed: %w", outcome.err)
+				}
+				log.Warn().Err(outcome.err).Str("walk", outcome.key).Msg("ONU walk failed, continuing without it")
+				continue
+			}
+			baseOID := walkOIDByKey[outcome.key]
+			switch outcome.key {
+			case "status":
+				for _, pdu := range outcome.pdus {
+					if id, err := extractONUID(pdu.Name, baseOID); err == nil {
+						onu := getONU(id)
+						onu.Status = snmp.ParseONUStatus(&pdu)
+						onu.StatusCode = snmp.ParseStatusToInt(&pdu)
+					}
+				}
+			case "name":
+				for _, pdu := range outcome.pdus {
+					if id, err := extractONUID(pdu.Name, baseOID); err == nil {
+						getONU(id).Name = strings.TrimSpace(snmp.PduToString(&pdu))
+					}
+				}
+			case "sn":
+				for _, pdu := range outcome.pdus {
+					if id, err := extractONUID(pdu.Name, baseOID); err == nil {
+						getONU(id).SerialNumber = snmp.ParseSerialNumber(&pdu)
+					}
+				}
+			case "rx":
+				for _, pdu := range outcome.pdus {
+					if id, err := extractONUID(pdu.Name, baseOID); err == nil {
+						raw := snmp.GetPDUInt(&pdu)
+						if adapter != nil {
+							getONU(id).RXPower = adapter.ConvertPower(raw)
+						} else {
+							getONU(id).RXPower = domain.ConvertPower(raw)
+						}
+					}
+				}
 			}
 		}
 
@@ -154,44 +233,6 @@ func (s *ONUService) GetONUList(ctx context.Context, oltID string, board, pon in
 		}
 
 		log.Debug().Int("count", len(onuMap)).Msg("ONUs discovered")
-
-		// NOTE: Offline reason is intentionally not walked for list to keep it fast.
-
-		// 2. Walk Names
-		nameOID := snmp.BuildWalkOID(snmp.OIDONUName, ifIndex)
-		if results, err := client.BulkWalk(nameOID); err == nil {
-			for _, pdu := range results {
-				if id, err := extractONUID(pdu.Name, nameOID); err == nil {
-					getONU(id).Name = strings.TrimSpace(snmp.PduToString(&pdu))
-				}
-			}
-		}
-
-		// 3. Walk Serial Numbers
-		snOID := snmp.BuildWalkOID(snmp.OIDONUSerialNumber, ifIndex)
-		if results, err := client.BulkWalk(snOID); err == nil {
-			for _, pdu := range results {
-				if id, err := extractONUID(pdu.Name, snOID); err == nil {
-					getONU(id).SerialNumber = snmp.ParseSerialNumber(&pdu)
-				}
-			}
-		}
-
-		// 4. Walk RX Power
-		adapter, _ := s.manager.GetAdapter(oltID)
-		rxOID := snmp.BuildWalkOID(snmp.OIDONURXPower, ifIndex)
-		if results, err := client.BulkWalk(rxOID); err == nil {
-			for _, pdu := range results {
-				if id, err := extractONUID(pdu.Name, rxOID); err == nil {
-					raw := snmp.GetPDUInt(&pdu)
-					if adapter != nil {
-						getONU(id).RXPower = adapter.ConvertPower(raw)
-					} else {
-						getONU(id).RXPower = float64(raw-10000) / 100.0
-					}
-				}
-			}
-		}
 
 		// Convert map to sorted slice
 		onus := make([]domain.ONU, 0, len(onuMap))
@@ -375,7 +416,7 @@ func (s *ONUService) GetONUDetail(ctx context.Context, oltID string, board, pon,
 		if adapter != nil {
 			onu.RXPower = adapter.ConvertPower(raw)
 		} else {
-			onu.RXPower = float64(raw-10000) / 100.0
+			onu.RXPower = domain.ConvertPower(raw)
 		}
 	}
 
@@ -384,7 +425,7 @@ func (s *ONUService) GetONUDetail(ctx context.Context, oltID string, board, pon,
 		if adapter != nil {
 			onu.TXPower = adapter.ConvertPower(raw)
 		} else {
-			onu.TXPower = float64(raw-10000) / 100.0
+			onu.TXPower = domain.ConvertPower(raw)
 		}
 	}
 

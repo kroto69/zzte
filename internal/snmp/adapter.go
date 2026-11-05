@@ -1,6 +1,8 @@
 package snmp
 
 import (
+	"olt-monitor/internal/domain"
+
 	"github.com/rs/zerolog/log"
 )
 
@@ -45,7 +47,9 @@ func (a *V1Adapter) ConvertPower(raw int) float64 {
 		return 0.0
 	}
 	// Universal: (raw - 15000) / 500
-	return float64(raw-15000) / 500.0
+	// Sanitize: a dead/LOS ONU returns near-sentinel raw values (e.g. 65308)
+	// that would otherwise convert to impossible values like +100.616 dBm.
+	return domain.SanitizePower(float64(raw-15000) / 500.0)
 }
 
 // ConvertPower converts raw power value to dBm
@@ -56,7 +60,9 @@ func (a *V2Adapter) ConvertPower(raw int) float64 {
 		return 0.0
 	}
 	// Universal: (raw - 15000) / 500
-	return float64(raw-15000) / 500.0
+	// Sanitize: a dead/LOS ONU returns near-sentinel raw values (e.g. 65308)
+	// that would otherwise convert to impossible values like +100.616 dBm.
+	return domain.SanitizePower(float64(raw-15000) / 500.0)
 }
 
 // DetectFirmware auto-detects firmware version from OLT

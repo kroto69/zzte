@@ -133,7 +133,7 @@ Adaptive TTL: `base + (duration × 2)`, max `base × 5`. Longer SNMP walk → lo
 ## 3-Level Fallback (GetONUList)
 1. Cache complete (Name filled) → return (<100ms)
 2. Cache incomplete + Names cache → merge → return (fast)
-3. Cache empty → on-demand SNMP walk + save to list & names cache (7-12s)
+3. Cache empty → on-demand SNMP walk + save to list & names cache (7-12s sequential → ~2-4s since 2026-10-23: 4 walks run in parallel on isolated SNMP clients, still under the per-OLT SNMP lock; status walk failure still fails the request, others stay best-effort)
 
 ## Environment Variables
 | Variable | Default | Description |

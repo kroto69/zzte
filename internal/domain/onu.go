@@ -122,8 +122,21 @@ func OfflineCodeToString(code int) string {
 	}
 }
 
+// SanitizePower returns 0.0 ("no reading") when a converted dBm value is
+// physically impossible for GPON optics. A dead or LOS ONU makes the OLT
+// return near-sentinel raw values (e.g. 65308, close to the 65535 marker)
+// that would otherwise convert to absurd values such as +100.616 dBm.
+// Real GPON readings live roughly between -40 dBm and +5 dBm; the
+// [-50, +10] window is deliberately generous so no real reading is dropped.
+func SanitizePower(dbm float64) float64 {
+	if dbm < -50 || dbm > 10 {
+		return 0.0
+	}
+	return dbm
+}
+
 // ConvertPower converts raw SNMP power value to dBm
 // Formula: (raw - 10000) / 100
 func ConvertPower(raw int) float64 {
-	return float64(raw-10000) / 100.0
+	return SanitizePower(float64(raw-10000) / 100.0)
 }
