@@ -187,7 +187,7 @@ func (s *ONUService) GetONUList(ctx context.Context, oltID string, board, pon in
 					if adapter != nil {
 						getONU(id).RXPower = adapter.ConvertPower(raw)
 					} else {
-						getONU(id).RXPower = float64(raw-10000) / 100.0
+						getONU(id).RXPower = domain.ConvertPower(raw)
 					}
 				}
 			}
@@ -375,7 +375,7 @@ func (s *ONUService) GetONUDetail(ctx context.Context, oltID string, board, pon,
 		if adapter != nil {
 			onu.RXPower = adapter.ConvertPower(raw)
 		} else {
-			onu.RXPower = float64(raw-10000) / 100.0
+			onu.RXPower = domain.ConvertPower(raw)
 		}
 	}
 
@@ -384,7 +384,7 @@ func (s *ONUService) GetONUDetail(ctx context.Context, oltID string, board, pon,
 		if adapter != nil {
 			onu.TXPower = adapter.ConvertPower(raw)
 		} else {
-			onu.TXPower = float64(raw-10000) / 100.0
+			onu.TXPower = domain.ConvertPower(raw)
 		}
 	}
 
