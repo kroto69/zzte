@@ -3,7 +3,10 @@ package service
 import (
 	"fmt"
 	"net"
+	"regexp"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/rs/zerolog/log"
@@ -12,19 +15,169 @@ import (
 	"olt-monitor/internal/domain"
 )
 
-// TelnetService handles Telnet interactions with OLTs
-type TelnetService struct{}
+// TelnetService handles Telnet interactions with OLTs.
+// Satu instance dipakai bersama (dibuat sekali di main) supaya semaphore
+// per-OLT mengikat semua pemakai Telnet (detail, reboot, provisioning).
+type TelnetService struct {
+	mu    sync.Mutex
+	slots map[string]chan struct{} // semaphore per host OLT
+}
 
 const (
 	telnetDialTimeout    = 3 * time.Second
 	telnetLoginTimeout   = 5 * time.Second
 	telnetCommandTimeout = 15 * time.Second
 	telnetBatchTimeout   = 30 * time.Second
+
+	// maxTelnetSessionsPerOLT membatasi session Telnet bersamaan per OLT
+	// (host). OLT ZTE umumnya hanya menyediakan ~5 VTY; 2 session untuk
+	// zzte menyisakan ruang bagi CLI juragan/teknisi.
+	maxTelnetSessionsPerOLT = 2
+	// telnetSlotAcquireTimeout: berapa lama menunggu giliran session
+	// Telnet sebelum menyerah (dan pemanggil degrade gracefully).
+	telnetSlotAcquireTimeout = 3 * time.Second
 )
 
 // NewTelnetService creates a new TelnetService
 func NewTelnetService() *TelnetService {
-	return &TelnetService{}
+	return &TelnetService{
+		slots: make(map[string]chan struct{}),
+	}
+}
+
+// acquireTelnetSlot mengambil satu slot session Telnet untuk host OLT.
+// Mengembalikan fungsi release + true bila berhasil; false bila semua slot
+// penuh selama telnetSlotAcquireTimeout (pemanggil harus degrade gracefully,
+// bukan menunggu tanpa batas).
+func (s *TelnetService) acquireTelnetSlot(host string) (func(), bool) {
+	s.mu.Lock()
+	if s.slots == nil {
+		s.slots = make(map[string]chan struct{})
+	}
+	ch, ok := s.slots[host]
+	if !ok {
+		ch = make(chan struct{}, maxTelnetSessionsPerOLT)
+		s.slots[host] = ch
+	}
+	s.mu.Unlock()
+
+	select {
+	case ch <- struct{}{}:
+		return func() { <-ch }, true
+	case <-time.After(telnetSlotAcquireTimeout):
+		return nil, false
+	}
+}
+
+// ONUPowerAttenuation adalah hasil `show pon power attenuation` untuk satu ONU.
+// Semua field pointer: nil berarti "no signal" / "N/A" (ONU tidak ada sinyal
+// optik), bukan 0 dBm.
+type ONUPowerAttenuation struct {
+	OnuRx   *float64 // down Rx: daya yang diterima ONU dari OLT (dBm)
+	OnuTx   *float64 // up Tx: daya pancar laser modem (dBm)
+	OltRx   *float64 // up Rx: daya yang diterima OLT dari modem (dBm) — "TX Power" juragan
+	OltTx   *float64 // down Tx: daya pancar OLT (dBm)
+	AttUp   *float64 // atenuasi upstream (dB)
+	AttDown *float64 // atenuasi downstream (dB)
+}
+
+var (
+	// `Rx :-28.358(dbm)` / `Tx:2.468(dbm)` / `Tx:N/A` / `Rx :no signal`
+	powerTokenRe = regexp.MustCompile(`(?i)\b(rx|tx)\s*:?\s*([^\s]+)`)
+	// `30.826(dB)` — butuh `)` tepat setelah dB supaya `(dbm)` tidak ikut cocok.
+	attenuationRe = regexp.MustCompile(`(?i)(-?\d+(?:\.\d+)?)\s*\(db\)`)
+)
+
+// ParsePowerAttenuation mem-parse output `show pon power attenuation gpon-onu_...`.
+// Contoh yang dikenali (dari OLT live):
+//
+//	up      Rx :-28.358(dbm)      Tx:2.468(dbm)        30.826(dB)
+//	down    Tx :6.033(dbm)        Rx:-23.468(dbm)      29.501(dB)
+//
+// Varian tanpa sinyal (`Rx :no signal`, `Tx:N/A`) menghasilkan nil.
+func ParsePowerAttenuation(raw string) ONUPowerAttenuation {
+	var att ONUPowerAttenuation
+	for _, line := range strings.Split(raw, "\n") {
+		low := strings.ToLower(strings.TrimSpace(line))
+		var isUp, isDown bool
+		if strings.HasPrefix(low, "up") {
+			isUp = true
+		} else if strings.HasPrefix(low, "down") {
+			isDown = true
+		} else {
+			continue
+		}
+
+		var rx, tx *float64
+		for _, m := range powerTokenRe.FindAllStringSubmatch(low, -1) {
+			v, err := parsePowerToken(m[2])
+			if err != nil {
+				continue // "no signal" / "N/A" -> nil
+			}
+			if m[1] == "rx" {
+				rx = v
+			} else {
+				tx = v
+			}
+		}
+
+		var attenuation *float64
+		if m := attenuationRe.FindStringSubmatch(low); m != nil {
+			if v, err := strconv.ParseFloat(m[1], 64); err == nil {
+				attenuation = &v
+			}
+		}
+
+		if isUp {
+			att.OltRx, att.OnuTx, att.AttUp = rx, tx, attenuation
+		} else if isDown {
+			att.OltTx, att.OnuRx, att.AttDown = tx, rx, attenuation
+		}
+	}
+	return att
+}
+
+// parsePowerToken mengubah token seperti "-28.358(dbm)" / "2.468(dbm)"
+// menjadi *float64. Token "no" / "n/a" (dari "no signal" / "N/A")
+// mengembalikan error supaya jadi nil.
+func parsePowerToken(tok string) (*float64, error) {
+	tok = strings.TrimSuffix(tok, "(dbm)")
+	v, err := strconv.ParseFloat(tok, 64)
+	if err != nil {
+		return nil, err
+	}
+	return &v, nil
+}
+
+// FetchONUPowerAttenuation menjalankan `show pon power attenuation`
+// untuk satu ONU via Telnet dan mem-parse hasilnya.
+// Dipakai HANYA dari GetONUDetail (saat user membuka detail ONU) —
+// bukan dari list/poller — supaya beban Telnet tetap kecil.
+// Gagal (slot penuh, OLT tidak menjawab) mengembalikan error; pemanggil
+// harus degrade gracefully (detail tetap tampil dengan data SNMP,
+// TX Power 0.0).
+func (s *TelnetService) FetchONUPowerAttenuation(config domain.OLTConfig, board, pon, onuID int) (*ONUPowerAttenuation, error) {
+	host := config.SNMP.Host
+	release, ok := s.acquireTelnetSlot(host)
+	if !ok {
+		return nil, fmt.Errorf("slot Telnet penuh untuk OLT %s (maks %d session bersamaan)", host, maxTelnetSessionsPerOLT)
+	}
+	defer release()
+
+	sess, err := s.Connect(config)
+	if err != nil {
+		return nil, err
+	}
+	defer sess.Close()
+
+	cmd := fmt.Sprintf("show pon power attenuation gpon-onu_1/%d/%d:%d", board, pon, onuID)
+	raw, err := sess.SendCommand(cmd)
+	if err != nil {
+		return nil, fmt.Errorf("gagal menjalankan %q: %w", cmd, err)
+	}
+
+	att := ParsePowerAttenuation(raw)
+	return &att, nil
 }
 
 // TelnetSession wraps a telnet connection

@@ -25,13 +25,15 @@ type ONUService struct {
 	manager *OLTManager
 	cache   *cache.RedisCache
 	sfGroup singleflight.Group // deduplikasi request SNMP per OLT+board+pon
+	telnet  *TelnetService     // nil = tanpa enrichment Telnet (detail tetap jalan via SNMP)
 }
 
 // NewONUService creates a new ONU service
-func NewONUService(manager *OLTManager, cache *cache.RedisCache) *ONUService {
+func NewONUService(manager *OLTManager, cache *cache.RedisCache, telnet *TelnetService) *ONUService {
 	return &ONUService{
 		manager: manager,
 		cache:   cache,
+		telnet:  telnet,
 	}
 }
 
@@ -420,12 +422,15 @@ func (s *ONUService) GetONUDetail(ctx context.Context, oltID string, board, pon,
 		}
 	}
 
+	// Kolom .14 adalah daya pancar laser modem (positif, ~+2,4 dBm) —
+	// BUKAN "TX Power" yang juragan pantau. Nilai laser disimpan terpisah
+	// di LaserTxPower; TXPower diisi dari up Rx via Telnet di bawah.
 	if pdu, ok := pduMap[oidTXPower]; ok {
 		raw := snmp.GetPDUInt(pdu)
 		if adapter != nil {
-			onu.TXPower = adapter.ConvertPower(raw)
+			onu.LaserTxPower = adapter.ConvertPower(raw)
 		} else {
-			onu.TXPower = domain.ConvertPower(raw)
+			onu.LaserTxPower = domain.ConvertPower(raw)
 		}
 	}
 
@@ -439,6 +444,14 @@ func (s *ONUService) GetONUDetail(ctx context.Context, oltID string, board, pon,
 
 	onu.WanIp = getString(oidWanIp)
 
+	// TX Power (up Rx: level yang diterima OLT dari modem, negatif)
+	// tidak ada di SNMP — diambil via Telnet (`show pon power attenuation`)
+	// HANYA saat detail dibuka, dan hanya untuk ONU yang online-like
+	// (ONU offline/LOS tidak ada sinyalnya, jadi tidak perlu di-dial).
+	// Best-effort: gagal Telnet tidak menggagalkan detail (TXPower tetap
+	// 0.0 dan detail tetap tampil dengan data SNMP).
+	s.enrichUpRxPower(oltID, board, pon, onuID, onu)
+
 	if s.cache != nil {
 		if data, err := json.Marshal(onu); err == nil {
 			ttl := adaptiveTTL(cache.TTLONUDetail, time.Since(start))
@@ -447,6 +460,36 @@ func (s *ONUService) GetONUDetail(ctx context.Context, oltID string, board, pon,
 	}
 
 	return onu, nil
+}
+
+// enrichUpRxPower mengisi onu.TXPower dengan up Rx (level yang diterima OLT
+// dari modem) via Telnet. Dipanggil hanya dari GetONUDetail — jadi TX hanya
+// diambil saat user membuka detail ONU, tidak pernah dari list/poller.
+// Gagal (Telnet tidak terkonfigurasi, slot penuh, OLT tidak menjawab) hanya
+// dicatat di log; TXPower tetap 0.0 dan detail tetap tampil dengan data SNMP.
+func (s *ONUService) enrichUpRxPower(oltID string, board, pon, onuID int, onu *domain.ONU) {
+	if s.telnet == nil || !isOnlineLikeStatus(onu.StatusCode) {
+		return
+	}
+
+	olt, err := s.manager.GetOLT(oltID)
+	if err != nil {
+		log.Warn().Err(err).Str("oltId", oltID).Msg("Gagal ambil config OLT untuk Telnet up Rx")
+		return
+	}
+	// Tanpa kredensial Telnet, jangan coba dial sama sekali.
+	if strings.TrimSpace(olt.Config.Telnet.User) == "" || strings.TrimSpace(olt.Config.Telnet.Password) == "" {
+		return
+	}
+
+	att, err := s.telnet.FetchONUPowerAttenuation(olt.Config, board, pon, onuID)
+	if err != nil {
+		log.Warn().Err(err).Str("oltId", oltID).Int("board", board).Int("pon", pon).Int("onuId", onuID).Msg("Telnet up Rx gagal, TX Power tidak tersedia")
+		return
+	}
+	if att != nil && att.OltRx != nil {
+		onu.TXPower = domain.SanitizePower(*att.OltRx)
+	}
 }
 
 // GetPONList retrieves list of PONs with descriptions for a specific board

@@ -50,7 +50,6 @@ func NewRouter(oltHandler *OLTHandler, onuHandler *ONUHandler, authHandler *Auth
 
 			r.Group(func(r chi.Router) {
 
-
 				// OLT routes (read)
 				r.Get("/olts", oltHandler.ListOLTs)
 				r.Get("/olt/{oltId}", oltHandler.GetOLT)
@@ -74,7 +73,6 @@ func NewRouter(oltHandler *OLTHandler, onuHandler *ONUHandler, authHandler *Auth
 			})
 
 			r.Group(func(r chi.Router) {
-
 
 				// OLT routes (write)
 				r.Post("/olt/test-connection", oltHandler.TestConnection)
@@ -128,8 +126,7 @@ func zerologMiddleware(next http.Handler) http.Handler {
 }
 
 // SetupRoutes creates all handlers and returns configured router
-func SetupRoutes(cfg *config.Config, manager *service.OLTManager, onuService *service.ONUService, indexerService *service.IndexerService, cache *cache.RedisCache) *chi.Mux {
-	telnetService := service.NewTelnetService()
+func SetupRoutes(cfg *config.Config, manager *service.OLTManager, onuService *service.ONUService, indexerService *service.IndexerService, cache *cache.RedisCache, telnetService *service.TelnetService) *chi.Mux {
 	activityService := service.NewActivityService(cache)
 	oltHandler := NewOLTHandler(manager, indexerService, cfg, telnetService, activityService)
 	onuHandler := NewONUHandler(onuService)

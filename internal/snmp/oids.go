@@ -20,8 +20,12 @@ const (
 	// ONU RX Power: .1.3.6.1.4.1.3902.1012.3.50.12.1.1.10.{ifIndex}.{onuId}.1
 	OIDONURXPower = OIDBase + ".3.50.12.1.1.10"
 
-	// ONU TX Power: .1.3.6.1.4.1.3902.1012.3.50.12.1.1.9.{ifIndex}.{onuId}.1
-	OIDONUTXPower = OIDBase + ".3.50.12.1.1.9"
+	// ONU TX Power: .1.3.6.1.4.1.3902.1012.3.50.12.1.1.14.{ifIndex}.{onuId}.1
+	// Column .14, NOT .9: the .9 column returns noSuchInstance for every ONU
+	// (TX showed 0 dBm for all ONUs). Column .14 is the live-verified TX power
+	// column on C300/C320 V2.1.0 (megadata-dev/go-snmp-olt-zte-c320, same table
+	// and instance encoding, e.g. tx_power 2.534 dBm).
+	OIDONUTXPower = OIDBase + ".3.50.12.1.1.14"
 
 	// ONU Distance: .1.3.6.1.4.1.3902.1012.3.11.4.1.2.{ifIndex}.{onuId} (meters)
 	OIDONUDistance = OIDBase + ".3.11.4.1.2"

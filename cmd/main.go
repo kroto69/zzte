@@ -59,7 +59,10 @@ func main() {
 	}
 
 	// Create services
-	onuService := service.NewONUService(manager, redisCache)
+	// Satu instance TelnetService dipakai bersama (ONUService + handlers)
+	// supaya semaphore per-OLT mengikat semua pemakai Telnet.
+	telnetService := service.NewTelnetService()
+	onuService := service.NewONUService(manager, redisCache, telnetService)
 	indexerService := service.NewIndexerService(manager, redisCache, cfg)
 
 	// Context untuk graceful shutdown
@@ -88,7 +91,7 @@ func main() {
 	}
 
 	// Setup HTTP server
-	router := handler.SetupRoutes(cfg, manager, onuService, indexerService, redisCache)
+	router := handler.SetupRoutes(cfg, manager, onuService, indexerService, redisCache, telnetService)
 	srv := server.NewServer(cfg, router)
 
 	// Graceful shutdown

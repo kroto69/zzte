@@ -18,6 +18,7 @@ func TestConvertPower(t *testing.T) {
 	}{
 		{"normal RX", 5750, -18.5},
 		{"normal TX", 17500, 5.0},
+		{"TX power from reference project", 16267, 2.534},
 		{"zero dBm", 15000, 0.0},
 		{"negative reading (NetNumen -30)", 65308, -30.456},
 		{"negative reading, signed input", -228, -30.456},

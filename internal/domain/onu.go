@@ -4,17 +4,21 @@ import "time"
 
 // ONU represents an Optical Network Unit connected to an OLT (full detail)
 type ONU struct {
-	OltID         string    `json:"oltId"`
-	Board         int       `json:"board"`
-	Pon           int       `json:"pon"`
-	OnuID         int       `json:"onuId"`
-	Name          string    `json:"name"`
-	SerialNumber  string    `json:"serialNumber"`
-	Type          string    `json:"type"`
-	Status        string    `json:"status"`
-	StatusCode    int       `json:"statusCode"`
-	RXPower       float64   `json:"rxPower"`
-	TXPower       float64   `json:"txPower"`
+	OltID        string  `json:"oltId"`
+	Board        int     `json:"board"`
+	Pon          int     `json:"pon"`
+	OnuID        int     `json:"onuId"`
+	Name         string  `json:"name"`
+	SerialNumber string  `json:"serialNumber"`
+	Type         string  `json:"type"`
+	Status       string  `json:"status"`
+	StatusCode   int     `json:"statusCode"`
+	RXPower      float64 `json:"rxPower"`
+	TXPower      float64 `json:"txPower"`
+	// LaserTxPower adalah daya pancar laser modem (.14, dBm, positif).
+	// TXPower yang juragan pantau adalah up Rx (level yang diterima OLT,
+	// negatif) dan diisi dari CLI via Telnet, bukan dari kolom ini.
+	LaserTxPower  float64   `json:"laserTxPower,omitempty"`
 	DistanceM     int       `json:"distanceM,omitempty"`
 	DistanceKm    float64   `json:"distanceKm,omitempty"`
 	LastOnline    time.Time `json:"lastOnline"`
